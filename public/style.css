@@ -2054,3 +2054,213 @@ select.form-control {
   margin-top: 0.5rem;
 }
 
+/* =====================================================================
+   Visual Inventory card - Minecraft GUI style (same look as the chest GUI)
+   ===================================================================== */
+.mc-inventory-panel {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 0.7rem 1rem 1rem 1rem;
+  background: #3a3a3a;
+  border: 3px solid #0d0d0d;
+  border-radius: 4px;
+  box-shadow:
+    inset 3px 3px 0 #5c5c5c,
+    inset -3px -3px 0 #262626,
+    0 12px 30px rgba(0, 0, 0, 0.55);
+}
+
+.mc-inventory-title {
+  font-family: 'Monocraft', 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 400;
+  color: #d9d9d9;
+  text-shadow: 1px 1px 0 #1a1a1a;
+  margin-bottom: 0.45rem;
+}
+
+.mc-inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  gap: 2px;
+  padding: 0;
+}
+
+/* Inventory slots are display-only (no click action) */
+.mc-inventory-grid .gui-slot.readonly {
+  cursor: default;
+}
+
+.mc-inventory-hint {
+  margin-top: 0.5rem;
+  font-family: 'Monocraft', 'JetBrains Mono', monospace;
+  font-size: 0.55rem;
+  color: #8f8f8f;
+  text-shadow: 1px 1px 0 #1a1a1a;
+}
+
+/* Flash when an item is right-clicked */
+.mc-inventory-grid .gui-slot.used {
+  animation: mcSlotUsed 0.45s ease-out;
+}
+
+@keyframes mcSlotUsed {
+  0%   { background: #b9a43a; }
+  100% { background: #4a4a4a; }
+}
+
+/* The banner for "no accounts" must disappear once an account exists */
+.empty-accounts-banner.hidden {
+  display: none;
+}
+
+/* =====================================================================
+   Minimal glass theme: transparent panels over a background image.
+   Put your picture at public/bg.jpg (any name: change --bg-image below).
+   ===================================================================== */
+:root {
+  --bg-image: url('/bg.jpg');
+  --bg-dark: #0a0a0c;
+  --bg-card: rgba(12, 12, 16, 0.38);
+  --bg-card-hover: rgba(255, 255, 255, 0.08);
+  --border-color: rgba(255, 255, 255, 0.10);
+  --accent-primary: rgba(255, 255, 255, 0.85);
+  --accent-primary-hover: #ffffff;
+  --shadow-glow: none;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+}
+
+body {
+  background:
+    linear-gradient(rgba(6, 8, 10, 0.58), rgba(6, 8, 10, 0.58)),
+    var(--bg-image) center / cover no-repeat fixed,
+    var(--bg-dark);
+}
+
+.sidebar {
+  background: rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-right: 1px solid var(--border-color);
+}
+
+.card, .stat-card, .account-tab-item {
+  background: var(--bg-card);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  box-shadow: none;
+}
+
+.account-tab-item.active {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: none;
+}
+
+.btn-add-account-tab {
+  background: transparent;
+  border: 1px dashed rgba(255, 255, 255, 0.28);
+  color: var(--text-muted);
+}
+
+.btn-primary {
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: #fff;
+  box-shadow: none;
+}
+.btn-success {
+  background: rgba(16, 185, 129, 0.16);
+  border: 1px solid rgba(16, 185, 129, 0.55);
+  color: #6ee7b7;
+  box-shadow: none;
+}
+.btn-danger {
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  color: #fca5a5;
+  box-shadow: none;
+}
+.btn-primary:hover, .btn-success:hover, .btn-danger:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* Live data switch */
+.live-switch { display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none; font-size: 0.8rem; color: var(--text-muted); }
+.live-switch input { display: none; }
+.live-slider { position: relative; width: 34px; height: 18px; border-radius: 999px; background: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.25); transition: var(--transition); }
+.live-slider::after { content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #d1d5db; transition: var(--transition); }
+.live-switch input:checked + .live-slider { background: rgba(16, 185, 129, 0.35); border-color: rgba(16, 185, 129, 0.8); }
+.live-switch input:checked + .live-slider::after { transform: translateX(16px); background: #6ee7b7; }
+.live-text.on { color: #6ee7b7; }
+
+/* Clickable parts of chat messages (e.g. "[Player's Inventory]") */
+a.chat-action {
+  color: #67e8f9;
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+a.chat-action:hover { color: #ffffff; text-decoration: underline; }
+
+/* =====================================================================
+   Console: readable hierarchy (time < badges < name < message), system lines dimmer
+   ===================================================================== */
+.terminal-body {
+  background: rgba(4, 7, 12, 0.55);
+  font-size: 0.82rem;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+.log-entry {
+  line-height: 1.55;
+  padding: 3px 10px;
+  margin: 1px 0;
+  border-left: 2px solid transparent;
+  border-radius: 4px;
+}
+.log-entry .timestamp {
+  color: rgba(255, 255, 255, 0.35);
+  font-variant-numeric: tabular-nums;
+  margin-right: 0.6rem;
+}
+/* chat */
+.log-entry.is-chat .log-msg { font-weight: 400; }
+.chat-badges { color: rgba(255, 255, 255, 0.42); font-size: 0.9em; font-weight: 400; }
+.chat-name { font-weight: 700; }
+.chat-sep { color: rgba(255, 255, 255, 0.3); }
+.chat-body { color: #e5e7eb; font-weight: 400; }
+.log-entry.is-own { background: rgba(192, 132, 252, 0.08); border-left-color: rgba(192, 132, 252, 0.6); }
+.log-entry.is-mention { background: rgba(250, 204, 21, 0.10); border-left-color: #facc15; }
+/* server messages that are not chat */
+.log-entry.is-system .log-msg { color: rgba(255, 255, 255, 0.5); font-weight: 400; }
+.log-entry.sys-join { border-left-color: rgba(74, 222, 128, 0.7); }
+.log-entry.sys-join .log-msg { color: #86efac; }
+.log-entry.sys-leave { border-left-color: rgba(248, 113, 113, 0.7); }
+.log-entry.sys-leave .log-msg { color: #fca5a5; }
+.log-entry.sys-announce { border-left-color: rgba(251, 191, 36, 0.6); }
+.log-entry.sys-announce .log-msg { color: #fcd34d; }
+/* quick command buttons: ghost style */
+.quick-cmd-btn, .quick-cmd-btn.highlight {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.75);
+}
+.quick-cmd-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+
+/* Quick button editor */
+.quick-cmd-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: 0.5rem; margin-bottom: 0.5rem; }
+.quick-cmd-row input {
+  min-width: 0;
+  padding: 0.5rem 0.7rem;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+.quick-cmd-row input:focus { outline: none; border-color: rgba(255, 255, 255, 0.4); }
+@media (max-width: 640px) { .quick-cmd-row { grid-template-columns: 1fr auto; } .quick-cmd-row input:nth-child(2) { grid-column: 1 / -1; order: 3; } }

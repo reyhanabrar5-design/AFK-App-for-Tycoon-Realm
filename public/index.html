@@ -21,7 +21,7 @@
         </div>
         <div class="brand-text">
           <h2>AFK Multi-Bot</h2>
-          <span>3D POV & Live Scoreboard</span>
+          <span>Live Scoreboard & Inventory</span>
         </div>
       </div>
 
@@ -32,7 +32,7 @@
         </button>
         <button class="nav-item" data-tab="pov">
           <i class="fa-solid fa-camera-retro"></i>
-          <span>Live 3D POV & Radar</span>
+          <span>Radar & Inventory</span>
         </button>
         <button class="nav-item" data-tab="settings">
           <i class="fa-solid fa-sliders"></i>
@@ -57,10 +57,18 @@
         </div>
         <div class="page-title">
           <h1 id="tab-title">Dashboard Multi-Bot AFK</h1>
-          <p id="tab-subtitle">Kelola 4 akun Minecraft AFK, Scoreboard Sidebar & Tampilan Kamera 3D POV</p>
+          <p id="tab-subtitle">Kelola akun Minecraft AFK, Scoreboard Sidebar & Inventory</p>
         </div>
 
         <div class="header-actions">
+          <label class="live-switch" title="Ambil data live (posisi, inventory, scoreboard). Mati = hemat bandwidth">
+            <input type="checkbox" id="live-toggle">
+            <span class="live-slider"></span>
+            <span class="live-text" id="live-text">Beku</span>
+          </label>
+          <button class="btn btn-secondary" id="btn-refresh-once" title="Ambil data terbaru satu kali">
+            <i class="fa-solid fa-rotate"></i>
+          </button>
           <button class="btn btn-secondary" id="btn-lock-dashboard" title="Kunci Dashboard Web">
             <i class="fa-solid fa-lock"></i> <span>Kunci Dashboard</span>
           </button>
@@ -200,7 +208,7 @@
           <div class="card scoreboard-card" style="flex: 1;">
             <div class="scoreboard-header">
               <i class="fa-solid fa-table-list"></i>
-              <h3 id="scoreboard-title">Gens Tycoon 4th</h3>
+              <h3 id="scoreboard-title">Scoreboard</h3>
             </div>
             <div class="scoreboard-lines" id="scoreboard-lines">
               <div class="scoreboard-row placeholder">
@@ -211,52 +219,8 @@
         </div>
       </div>
 
-      <!-- TAB 2: LIVE 3D POV & RADAR -->
+      <!-- TAB 2: RADAR & INVENTORY -->
       <div class="tab-content" id="tab-pov">
-        <!-- 3D WebGL Camera Viewport Card -->
-        <div class="card pov-card full-width" style="margin-bottom: 1.5rem;">
-          <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
-            <div style="display: flex; align-items: center; gap: 0.75rem;">
-              <i class="fa-solid fa-camera"></i>
-              <h3>Layar Kamera 3D WebGL POV (<span class="pov-bot-name">-</span>)</h3>
-            </div>
-            <div style="font-size: 0.82rem; color: var(--accent-info);">
-              <i class="fa-solid fa-hand-pointer"></i> Drag mouse di layar untuk memutar kamera 3D 360Â°
-            </div>
-          </div>
-
-          <div class="viewer-3d-wrapper" id="viewer-3d-wrapper">
-            <canvas id="three-canvas"></canvas>
-
-            <!-- Minecraft In-Game Scoreboard HUD Overlay on top-right corner of 3D POV Screen -->
-            <div class="pov-scoreboard-overlay" id="pov-scoreboard-overlay">
-              <div class="pov-sb-title" id="pov-sb-title">Gens Tycoon 4th</div>
-              <div class="pov-sb-lines" id="pov-sb-lines">
-                <div class="pov-sb-line" style="color: var(--text-muted); font-style: italic;">Menunggu data live scoreboard...</div>
-              </div>
-            </div>
-
-            <!-- Minecraft Live In-Game Chat HUD Overlay on bottom-left corner of 3D POV Screen -->
-            <div class="pov-chat-overlay" id="pov-chat-overlay">
-              <div class="pov-chat-lines" id="pov-chat-lines">
-                <div class="pov-chat-line system"><span style="color:#ffaa00;font-weight:bold;">AlviNation</span> Â» Live In-Game Chat POV...</div>
-              </div>
-            </div>
-
-            <!-- In-Game GUI Overlay Indicator inside 3D POV Viewport -->
-            <div class="pov-gui-indicator hidden" id="pov-gui-indicator">
-              <i class="fa-solid fa-window-restore"></i>
-              <span>Container GUI Terbuka: <strong id="pov-gui-title">Fix Your Generators</strong></span>
-              <button class="btn-sm btn-primary" id="btn-open-gui-modal">Buka Container GUI</button>
-            </div>
-
-            <div class="viewer-overlay-msg" id="viewer-overlay-msg">
-              <i class="fa-solid fa-camera-retro" style="font-size: 2.2rem; color: var(--accent-info); margin-bottom: 0.5rem;"></i>
-              <p>Kamera 3D WebGL POV akan aktif saat bot online & spawning ke dalam server.</p>
-            </div>
-          </div>
-        </div>
-
         <div class="pov-grid">
           <!-- Compass & Orientation Radar Card -->
           <div class="card pov-card">
@@ -300,8 +264,12 @@
               <h3>Visual Inventory (<span class="pov-bot-name">-</span>)</h3>
             </div>
 
-            <div class="inventory-grid-container" id="inventory-grid-container">
-              <!-- Dynamically populated 36 inventory slots -->
+            <div class="mc-inventory-panel">
+              <div class="mc-inventory-title">Inventory</div>
+              <div class="mc-inventory-grid" id="inventory-grid-container">
+                <!-- Dynamically populated 36 inventory slots (27 tas + 9 hotbar) -->
+              </div>
+              <div class="mc-inventory-hint">Klik kanan item untuk menggunakannya (booster, dll.)</div>
             </div>
           </div>
 
@@ -309,7 +277,7 @@
           <div class="card pov-card full-width">
             <div class="card-header">
               <i class="fa-solid fa-users"></i>
-              <h3>Pemain & Entitas Sekitar (<span class="pov-bot-name">-</span>)</h3>
+              <h3>Pemain Sekitar (<span class="pov-bot-name">-</span>)</h3>
             </div>
 
             <div class="entities-table-wrapper">
@@ -317,13 +285,13 @@
                 <thead>
                   <tr>
                     <th>Tipe / ID</th>
-                    <th>Nama Pemain / Entitas</th>
+                    <th>Nama Pemain</th>
                     <th>Jarak (Meter/Blok)</th>
                   </tr>
                 </thead>
                 <tbody id="entities-table-body">
                   <tr>
-                    <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 1rem;">Bot sedang offline atau tidak ada entitas di sekitar.</td>
+                    <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 1rem;">Bot sedang offline atau tidak ada pemain di sekitar.</td>
                   </tr>
                 </tbody>
               </table>
@@ -401,6 +369,26 @@
                 </button>
               </div>
             </form>
+          </div>
+
+          <!-- Custom quick buttons (global, all accounts) -->
+          <div class="card settings-card">
+            <div class="card-header">
+              <i class="fa-solid fa-bolt"></i>
+              <h3>Tombol Cepat (Semua Akun)</h3>
+            </div>
+            <p style="color: var(--text-muted); font-size: 0.8rem; margin-bottom: 0.8rem;">
+              Tombol muncul di samping /market di console. Isi perintah langsung dikirim ke chat akun yang sedang dipilih.
+            </p>
+            <div id="quick-cmd-editor"></div>
+            <div class="settings-actions">
+              <button type="button" class="btn btn-secondary" id="btn-add-quick-cmd">
+                <i class="fa-solid fa-plus"></i> Tambah Tombol
+              </button>
+              <button type="button" class="btn btn-primary" id="btn-save-quick-cmds">
+                <i class="fa-solid fa-floppy-disk"></i> Simpan Tombol
+              </button>
+            </div>
           </div>
 
           <!-- Security & Password Protection Settings Card -->
@@ -668,7 +656,6 @@
   </div>
 
   <!-- Three.js 3D WebGL Library & Socket.io -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="/socket.io/socket.io.js"></script>
   <script src="app.js"></script>
 </body>

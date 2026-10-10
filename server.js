@@ -1,3 +1,37 @@
+// --- Java "modified UTF-8" fix --------------------------------------------------------------
+// Minecraft 1.20.3+ sends chat/scoreboard text as NBT. Java encodes characters outside the BMP
+// (custom badge glyphs, emoji) as two 3-byte surrogates (CESU-8). Node's utf8 decoder turns every
+// one of those bytes into U+FFFD (six "?" per character). This shim re-decodes such buffers correctly.
+// It only runs when a normal decode produced U+FFFD AND the bytes contain 0xED, so it costs nothing otherwise.
+function decodeModifiedUtf8(buf) {
+  const units = [];
+  for (let i = 0; i < buf.length;) {
+    const b = buf[i];
+    if (b < 0x80) { units.push(b); i += 1; }
+    else if ((b & 0xE0) === 0xC0 && i + 1 < buf.length) { units.push(((b & 0x1F) << 6) | (buf[i + 1] & 0x3F)); i += 2; }
+    else if ((b & 0xF0) === 0xE0 && i + 2 < buf.length) { units.push(((b & 0x0F) << 12) | ((buf[i + 1] & 0x3F) << 6) | (buf[i + 2] & 0x3F)); i += 3; }
+    else if ((b & 0xF8) === 0xF0 && i + 3 < buf.length) {
+      const cp = ((b & 0x07) << 18) | ((buf[i + 1] & 0x3F) << 12) | ((buf[i + 2] & 0x3F) << 6) | (buf[i + 3] & 0x3F);
+      const v = cp - 0x10000;
+      units.push(0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF));
+      i += 4;
+    } else { units.push(0xFFFD); i += 1; }
+  }
+  let out = '';
+  for (let i = 0; i < units.length; i += 8192) out += String.fromCharCode.apply(null, units.slice(i, i + 8192));
+  return out;
+}
+const originalBufferToString = Buffer.prototype.toString;
+Buffer.prototype.toString = function (encoding, start, end) {
+  const text = originalBufferToString.call(this, encoding, start, end);
+  if ((encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') && text.includes('\uFFFD')) {
+    const slice = this.subarray(start || 0, end === undefined ? this.length : end);
+    if (slice.includes(0xED)) return decodeModifiedUtf8(slice);
+  }
+  return text;
+};
+// ---------------------------------------------------------------------------------------------
+
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -18,17 +52,66 @@ try {
 } catch (e) { }
 
 const app = express();
+app.get('/healthz', (req, res) => res.type('text/plain').send('ok')); // tiny response for UptimeRobot
 const server = http.createServer(app);
-const io = new Server(server);
+// permessageDeflate compresses the repetitive JSON updates (saves a lot of outbound bandwidth)
+const io = new Server(server, { perMessageDeflate: { threshold: 512 } });
 
 const PORT = process.env.PORT || 3000;
 const CONFIG_FILE = path.join(__dirname, 'bot_accounts.json');
+const QUICK_FILE = path.join(__dirname, 'quick_commands.json');
+
+// Custom quick buttons (shared by all accounts): [{ label, command }]
+function sanitizeQuickCommands(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 12).map((item) => {
+    const command = String((item && item.command) || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 256);
+    const label = String((item && item.label) || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 30) || command.slice(0, 30);
+    return { label, command };
+  }).filter(item => item.command);
+}
+function loadQuickCommands() {
+  try {
+    if (fs.existsSync(QUICK_FILE)) return sanitizeQuickCommands(JSON.parse(fs.readFileSync(QUICK_FILE, 'utf8')));
+  } catch (err) {
+    console.error('Gagal membaca quick_commands.json:', err.message);
+  }
+  return [];
+}
+let quickCommands = loadQuickCommands();
 
 function getBot(botId) {
   return typeof botId === 'string' && Object.prototype.hasOwnProperty.call(botInstances, botId)
     ? botInstances[botId]
     : null;
 }
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Commands whose result can be checked. A command counts as done when the server confirms it in chat
+// (pattern), the bot was moved (minMove blocks) or one of the listed events fired. Otherwise it is retried.
+const VERIFY_TIME_SCALE = Number(process.env.VERIFY_TIME_SCALE) || 1; // only lowered by tests
+const VERIFY_RULES = [
+  {
+    name: 'teleport ke island',
+    match: /^\/(is|island)(\s+(go|home|tp))?$/i,
+    pattern: /teleported to your island|teleport(ed)? to (your )?island/i,
+    minMove: 8,
+    timeoutMs: 10000,
+    attempts: 3,
+    retryDelayMs: 4000
+  },
+  {
+    name: 'pindah server',
+    match: /^\/server\s+\S+/i,
+    pattern: /already connected|sudah terhubung/i,
+    events: ['login', 'respawn', 'spawn'],
+    timeoutMs: 15000,
+    attempts: 2,
+    retryDelayMs: 3000
+  }
+];
+const SPATIAL_INTERVAL_MS = 2000; // how often position/inventory/scoreboard are checked for changes
+const ITEM_GUI_MAX_WAIT_MS = 90000; // how long an item stays in hand while its menu is open
 
 const defaultAccounts = [];
 
@@ -292,84 +375,111 @@ function getItemCustomText(item) {
   return { customName, nameRuns, loreRuns };
 }
 
+// Clickable parts of a chat message (e.g. "[Player's Inventory]" -> /command). Reads both the old
+// "clickEvent" and the 1.21.5+ "click_event" naming, also inside "extra" and translate "with" lists.
+function extractChatActions(msg) {
+  const out = [];
+  const root = msg && msg.json !== undefined ? msg.json : msg;
+  const plain = (j) => {
+    if (typeof j === 'string') return j;
+    if (!j || typeof j !== 'object') return '';
+    return String(j.text || '') + (Array.isArray(j.extra) ? j.extra.map(plain).join('') : '');
+  };
+  const walk = (j, depth) => {
+    if (!j || typeof j !== 'object' || depth > 12 || out.length >= 5) return;
+    const ce = j.clickEvent || j.click_event;
+    if (ce && ce.action === 'run_command') {
+      let cmd = String(ce.value !== undefined ? ce.value : (ce.command || '')).trim();
+      if (cmd && cmd.length <= 200 && !/[\r\n]/.test(cmd)) {
+        if (!cmd.startsWith('/')) cmd = '/' + cmd;
+        out.push({ text: plain(j).trim(), command: cmd });
+      }
+    }
+    if (Array.isArray(j.extra)) j.extra.forEach(e => walk(e, depth + 1));
+    if (Array.isArray(j.with)) j.with.forEach(e => walk(e, depth + 1));
+  };
+  walk(root, 0);
+  return out;
+}
+
 // Extract Scoreboard data from Mineflayer bot instance
-function extractScoreboard(bot) {
-  if (!bot) return { title: 'Gens Tycoon 4th', items: [] };
+const SCOREBOARD_DEFAULT_TITLE = 'Scoreboard';
 
-  let targetSidebar = null;
-
+// Objective that the server actually displays in the sidebar (display slot 1)
+function findSidebarObjective(bot) {
+  if (bot.scoreboard && bot.scoreboard.sidebar) return bot.scoreboard.sidebar;
   if (bot.scoreboards) {
     for (const key in bot.scoreboards) {
-      const sb = bot.scoreboards[key];
-      if (sb) {
-        if (sb.slot === 'sidebar' || sb.position === 'sidebar' || key === 'sidebar' || sb.slot === 1 || sb.position === 1 || !targetSidebar) {
-          targetSidebar = sb;
-          if (sb.slot === 'sidebar' || sb.position === 'sidebar' || key === 'sidebar' || sb.slot === 1 || sb.position === 1) break;
-        }
-      }
+      if (/sidebar/i.test(key) && bot.scoreboards[key]) return bot.scoreboards[key];
     }
   }
+  return null;
+}
 
-  if (!targetSidebar && bot.scoreboard) {
-    if (bot.scoreboard.sidebar) {
-      targetSidebar = bot.scoreboard.sidebar;
-    } else {
-      for (const key in bot.scoreboard) {
-        const sb = bot.scoreboard[key];
-        if (sb && typeof sb === 'object' && (sb.title || sb.items)) {
-          targetSidebar = sb;
-          break;
-        }
-      }
-    }
+// Text of one sidebar line: custom line text (1.20.3+) > team prefix + name + suffix > plain name
+function scoreboardLineText(bot, item) {
+  if (item.lineNbt) {
+    const custom = cleanMcText(item.lineNbt);
+    if (custom && custom !== '[object Object]') return custom;
+  }
+  const team = (bot.teamMap && bot.teamMap[item.name]) || (bot.teams && bot.teams[item.name]);
+  if (team) {
+    const text = (cleanMcText(team.prefix || '') + item.name + cleanMcText(team.suffix || '')).replace(/TAB-[A-Za-z]+-\d+/gi, '').trim();
+    if (text && !text.includes('[object Object]')) return text;
+  }
+  const plain = item.displayName ? cleanMcText(item.displayName) : cleanMcText(item.name);
+  return plain === '[object Object]' ? '' : plain;
+}
+
+function extractScoreboard(bot) {
+  if (!bot) return { title: SCOREBOARD_DEFAULT_TITLE, items: [], source: 'none' };
+
+  const sidebar = findSidebarObjective(bot);
+
+  // Title: real title from the server, otherwise the last real one we saw
+  let titleStr = sidebar ? cleanMcText(sidebar.title) : '';
+  if (titleStr && titleStr !== '[object Object]') {
+    bot._lastScoreboardTitle = titleStr;
+  } else {
+    titleStr = bot._lastScoreboardTitle || SCOREBOARD_DEFAULT_TITLE;
   }
 
-  let titleStr = targetSidebar ? cleanMcText(targetSidebar.title) : 'Gens Tycoon 4th';
-  if (!titleStr || titleStr === '[object Object]') {
-    titleStr = 'Gens Tycoon 4th';
-  }
+  // 1) Normal path: items of the objective shown in the sidebar
+  if (sidebar && sidebar.itemsMap) {
+    const rawItems = Object.values(sidebar.itemsMap)
+      .map((item, idx) => ({ item, idx }))
+      .filter(e => e.item)
+      .sort((x, y) => ((y.item.value || 0) - (x.item.value || 0)) || (x.idx - y.idx)); // stable on ties
 
-  const items = [];
-  if (targetSidebar && targetSidebar.items) {
-    const rawItems = Array.isArray(targetSidebar.items) ? targetSidebar.items : Object.values(targetSidebar.items);
-    rawItems.sort((a, b) => (b.value || 0) - (a.value || 0));
-
-    rawItems.forEach(item => {
-      if (!item) return;
-      let lineText = '';
-      if (bot.teams && bot.teams[item.name]) {
-        const t = bot.teams[item.name];
-        const pref = cleanMcText(t.prefix || '');
-        const suff = cleanMcText(t.suffix || '');
-        lineText = (pref + item.name + suff).trim();
-      }
-      if (!lineText) {
-        lineText = item.displayName ? cleanMcText(item.displayName) : cleanMcText(item.name);
-      }
-      if (lineText && lineText !== '[object Object]') {
+    const items = [];
+    rawItems.forEach(({ item }) => {
+      const lineText = scoreboardLineText(bot, item);
+      if (lineText) {
         items.push({
           name: lineText,
-          value: item.value !== undefined ? item.value : ''
+          value: item.hideValue ? '' : (item.value !== undefined ? item.value : '')
         });
       }
     });
+    if (items.length > 0) return { title: titleStr, items, source: `objective:${sidebar.name}` };
   }
 
-  // Fallback to Team prefixes/suffixes if standard items empty
-  if (items.length === 0 && bot.teams) {
-    const sortedTeams = Object.values(bot.teams);
-    sortedTeams.forEach(team => {
-      if (!team) return;
-      const pref = cleanMcText(team.prefix || '');
-      const suff = cleanMcText(team.suffix || '');
-      const full = (pref + (team.name || '') + suff).trim();
-      if (full && !full.includes('[object Object]')) {
-        items.push({ name: full, value: '' });
-      }
+  // 2) Backup: TAB plugin sidebar lines are teams named TAB-Sidebar-<n>. Only these teams are used,
+  //    never the per-player sorting teams, otherwise players show up between the sidebar lines.
+  if (bot.teams) {
+    const tabLines = Object.values(bot.teams)
+      .filter(t => t && /^TAB-Sidebar-\d+$/i.test(String(t.team || '')))
+      .sort((x, y) => parseInt(String(x.team).split('-').pop(), 10) - parseInt(String(y.team).split('-').pop(), 10));
+
+    const items = [];
+    tabLines.forEach(t => {
+      const text = (cleanMcText(t.prefix || '') + cleanMcText(t.suffix || '')).trim();
+      if (text && !text.includes('[object Object]')) items.push({ name: text, value: '' });
     });
+    if (items.length > 0) return { title: titleStr, items, source: 'tab-teams' };
   }
 
-  return { title: titleStr, items };
+  return { title: titleStr, items: [], source: 'none' };
 }
 
 // Bot Instance Manager class
@@ -380,7 +490,7 @@ class BotManager {
     this.status = 'offline';
     this.health = { health: 20, food: 20 };
     this.position = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, dimension: 'overworld' };
-    this.scoreboard = { title: 'Gens Tycoon 4th', items: [] };
+    this.scoreboard = { title: SCOREBOARD_DEFAULT_TITLE, items: [], source: 'none' };
     this.inventory = [];
     this.nearbyEntities = [];
     this.activeGuiWindow = null;
@@ -391,9 +501,10 @@ class BotManager {
     this.MAX_LOGS = 150;
   }
 
-  addLog(message, type = 'info') {
+  addLog(message, type = 'info', actions = null) {
     const timestamp = new Date().toLocaleTimeString('id-ID', { hour12: false });
     const entry = { timestamp, message, type, botId: this.config.id };
+    if (actions && actions.length > 0) entry.actions = actions;
     this.logHistory.push(entry);
     if (this.logHistory.length > this.MAX_LOGS) {
       this.logHistory.shift();
@@ -419,11 +530,62 @@ class BotManager {
   stopScript() {
     this.scriptTimeouts.forEach(clearTimeout);
     this.scriptTimeouts = [];
+    this._scriptRun = (this._scriptRun || 0) + 1; // invalidates a running script
   }
 
-  runScript() {
+  // Waits (max ~30s) until the bot has spawned in the world, so commands are not sent too early
+  async waitBotSpawned(runId) {
+    for (let i = 0; i < 60; i++) {
+      if (this._scriptRun !== runId || !this.bot || this.status !== 'online') return false;
+      if (this.bot.entity) return true;
+      await sleep(500);
+    }
+    return false;
+  }
+
+  // Sends `cmd` and resolves true once the server confirmed it (see VERIFY_RULES), false on timeout
+  sendAndVerify(cmd, rule) {
+    const bot = this.bot;
+    const startPos = bot.entity ? bot.entity.position.clone() : null;
+    return new Promise((resolve) => {
+      let settled = false;
+      const events = rule.events || [];
+      const onMsg = (msg) => { if (rule.pattern && rule.pattern.test(String(msg))) done(true); };
+      const onMove = () => {
+        if (rule.minMove && startPos && bot.entity && bot.entity.position.distanceTo(startPos) >= rule.minMove) done(true);
+      };
+      const onEvent = () => done(true);
+      const poll = setInterval(onMove, Math.max(10, 500 * VERIFY_TIME_SCALE));
+      const timer = setTimeout(() => done(false), rule.timeoutMs * VERIFY_TIME_SCALE);
+      function cleanup() {
+        clearInterval(poll);
+        clearTimeout(timer);
+        bot.removeListener('messagestr', onMsg);
+        bot.removeListener('forcedMove', onMove);
+        events.forEach(e => bot.removeListener(e, onEvent));
+      }
+      function done(ok) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(ok);
+      }
+      // Listen first, then send, so a very fast reply is not missed
+      bot.on('messagestr', onMsg);
+      bot.on('forcedMove', onMove);
+      events.forEach(e => bot.on(e, onEvent));
+      try {
+        bot.chat(cmd);
+      } catch (e) {
+        done(false);
+      }
+    });
+  }
+
+  async runScript() {
     this.stopScript();
     if (!this.config.scriptEnabled) return;
+    const runId = this._scriptRun;
 
     let items = [];
     if (Array.isArray(this.config.autoCmds) && this.config.autoCmds.length > 0) {
@@ -443,7 +605,7 @@ class BotManager {
         .split('\n')
         .map(l => l.trim())
         .filter(l => l && !l.startsWith('#') && !l.toLowerCase().includes('reco'));
-      
+
       let pendingDelaySec = 2;
       lines.forEach((line) => {
         const lower = line.toLowerCase();
@@ -463,37 +625,54 @@ class BotManager {
 
     this.addLog('Menjalankan Perintah Otomatis (Dengan Jeda Kustom)...', 'system');
 
-    let accumulatedDelayMs = 0;
-    items.forEach((item) => {
+    const alive = () => this._scriptRun === runId && this.bot && this.status === 'online';
+    const verify = this.config.verifyCommands !== false;
+    const mask = (text) => (this.config.password ? text.split(this.config.password).join('***') : text);
+
+    // Commands run one after another: each delay starts when the previous command is finished/confirmed
+    for (const item of items) {
+      await sleep(Math.max(0, item.delaySec) * 1000 * VERIFY_TIME_SCALE);
+      if (!alive()) return;
+      if (!(await this.waitBotSpawned(runId))) {
+        if (alive()) this.addLog('Bot belum selesai masuk ke dunia, perintah otomatis dihentikan.', 'warning');
+        return;
+      }
+
       let cmd = item.cmd;
-      if (!cmd.startsWith('/') && !cmd.toLowerCase().startsWith('send ')) {
-        cmd = '/' + cmd;
-      }
-      if (cmd.toLowerCase().startsWith('send ')) {
-        cmd = cmd.substring(5).trim();
-      }
-      if (this.config.password) {
-        cmd = cmd.replace(/\{password\}/g, this.config.password);
-      }
+      if (!cmd.startsWith('/') && !cmd.toLowerCase().startsWith('send ')) cmd = '/' + cmd;
+      if (cmd.toLowerCase().startsWith('send ')) cmd = cmd.substring(5).trim();
+      if (this.config.password) cmd = cmd.split('{password}').join(this.config.password);
 
-      const delayMs = Math.max(0, item.delaySec) * 1000;
-      accumulatedDelayMs += delayMs;
-      const executeTime = accumulatedDelayMs;
+      const rule = verify ? VERIFY_RULES.find(r => r.match.test(cmd)) : null;
+      const attempts = rule ? rule.attempts : 1;
 
-      const timer = setTimeout(() => {
-        if (this.bot && this.status === 'online') {
-          try {
-            this.bot.chat(cmd);
-            const logCmd = this.config.password ? cmd.replace(new RegExp(this.config.password, 'g'), '***') : cmd;
-            this.addLog(`[PERINTAH DILAKSANAKAN] ${logCmd}`, 'mychat');
-          } catch (e) {
-            this.addLog(`Gagal menjalankan perintah (${cmd}): ${e.message}`, 'error');
-          }
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        if (!alive()) return;
+        this.addLog(`[PERINTAH DILAKSANAKAN] ${mask(cmd)}${attempts > 1 ? ` (percobaan ${attempt}/${attempts})` : ''}`, 'mychat');
+
+        let ok = true;
+        try {
+          if (rule) ok = await this.sendAndVerify(cmd, rule);
+          else this.bot.chat(cmd);
+        } catch (e) {
+          this.addLog(`Gagal menjalankan perintah (${mask(cmd)}): ${e.message}`, 'error');
+          break;
         }
-      }, executeTime);
+        if (!rule) break;
+        if (!alive()) return;
 
-      this.scriptTimeouts.push(timer);
-    });
+        if (ok) {
+          this.addLog(`✓ ${rule.name} terkonfirmasi (${mask(cmd)})`, 'success');
+          break;
+        }
+        if (attempt < attempts) {
+          this.addLog(`${rule.name} belum terkonfirmasi, mengulang dalam ${rule.retryDelayMs / 1000} detik...`, 'warning');
+          await sleep(rule.retryDelayMs * VERIFY_TIME_SCALE);
+        } else {
+          this.addLog(`✗ ${rule.name} gagal terkonfirmasi setelah ${attempts} percobaan. Lanjut ke perintah berikutnya.`, 'error');
+        }
+      }
+    }
   }
 
   startSpatialBroadcast() {
@@ -514,15 +693,23 @@ class BotManager {
           };
         }
 
-        this.scoreboard = extractScoreboard(this.bot);
+        this.refreshScoreboard();
 
         if (this.bot.inventory) {
-          this.inventory = this.bot.inventory.items().map(item => ({
-            slot: item.slot,
-            name: item.name,
-            displayName: item.displayName || item.name,
-            count: item.count
-          }));
+          this.inventory = this.bot.inventory.items().map(item => {
+            // Same custom name / lore handling as the chest GUI, so tooltips show the server's item names
+            const custom = getItemCustomText(item);
+            const entry = {
+              slot: item.slot,
+              name: item.name,
+              displayName: cleanMcText(item.displayName || item.name || ''),
+              customName: custom.customName,
+              count: item.count
+            };
+            if (custom.nameRuns.length) entry.nameRuns = custom.nameRuns;
+            if (custom.loreRuns.length) entry.loreRuns = custom.loreRuns;
+            return entry;
+          });
         }
 
         // Strict Local Barrier Entity & Player Detection + Cross-Bot Distance Calculator
@@ -537,8 +724,9 @@ class BotManager {
             const dist = Math.round(botPos.distanceTo(e.position) * 10) / 10;
 
             if (dist <= 100) {
-              let entType = e.type || 'entity';
-              if (e.username || e.type === 'player') entType = 'player';
+              // Players only: mobs, items, armor stands and other entities are ignored
+              if (!(e.username || e.type === 'player')) continue;
+              const entType = 'player';
 
               let entName = e.username || cleanMcText(e.displayName) || e.name || e.mobType || '';
 
@@ -587,15 +775,34 @@ class BotManager {
         detected.sort((a, b) => a.distance - b.distance);
         this.nearbyEntities = detected.slice(0, 15);
 
-        io.emit('bot-spatial-update', {
-          botId: this.config.id,
+        // Nobody is watching: send nothing (a browser that connects later gets the full state from init-multi)
+        const liveRoom = io.sockets.adapter.rooms.get('live');
+        if (!liveRoom || liveRoom.size === 0) {
+          this._lastSent = {};
+          return;
+        }
+
+        // Send only the sections that changed since the last update
+        const sections = {
           position: this.position,
           scoreboard: this.scoreboard,
           inventory: this.inventory,
-          entities: this.nearbyEntities
-        });
+          entities: (this.nearbyEntities || []).map(e => ({ ...e, distance: Math.round(e.distance) }))
+        };
+        this._lastSent = this._lastSent || {};
+        const payload = { botId: this.config.id };
+        let changed = false;
+        for (const key in sections) {
+          const json = JSON.stringify(sections[key]);
+          if (json !== this._lastSent[key]) {
+            this._lastSent[key] = json;
+            payload[key] = sections[key];
+            changed = true;
+          }
+        }
+        if (changed) io.to('live').emit('bot-spatial-update', payload);
       } catch (err) { }
-    }, 1000);
+    }, SPATIAL_INTERVAL_MS);
   }
 
   stopSpatialBroadcast() {
@@ -661,6 +868,31 @@ class BotManager {
       this.updateStatus('error', err.message);
       this.scheduleReconnect();
       return;
+    }
+
+    // Minecraft 1.20.3+ changed the score packets (no "action" field, separate reset_score packet).
+    // Mineflayer ignores them, which leaves every scoreboard empty, so they are handled here.
+    const botRef = this.bot;
+    if (botRef._client) {
+      botRef._client.on('scoreboard_score', (packet) => {
+        if (this.bot !== botRef || packet.action !== undefined) return; // old protocol: mineflayer handles it
+        const board = botRef.scoreboards && botRef.scoreboards[packet.scoreName];
+        if (!board) return;
+        const item = board.add(packet.itemName, packet.value);
+        if (item) {
+          item.lineNbt = packet.display_name || null;
+          item.hideValue = packet.number_format === 0; // 0 = score number hidden
+        }
+        this.refreshScoreboard();
+      });
+      botRef._client.on('reset_score', (packet) => {
+        if (this.bot !== botRef) return;
+        const boards = packet.objective_name
+          ? [botRef.scoreboards && botRef.scoreboards[packet.objective_name]]
+          : Object.values(botRef.scoreboards || {});
+        boards.forEach(board => { if (board) board.remove(packet.entity_name); });
+        this.refreshScoreboard();
+      });
     }
 
     this.bot.once('login', () => {
@@ -773,13 +1005,13 @@ class BotManager {
     });
 
     this.bot.on('scoreboardPosition', () => {
-      this.scoreboard = extractScoreboard(this.bot);
+      this.refreshScoreboard();
     });
     this.bot.on('scoreboardScoreUpdated', () => {
-      this.scoreboard = extractScoreboard(this.bot);
+      this.refreshScoreboard();
     });
     this.bot.on('scoreboardTitleChanged', () => {
-      this.scoreboard = extractScoreboard(this.bot);
+      this.refreshScoreboard();
     });
 
     this.bot.on('health', () => {
@@ -793,7 +1025,7 @@ class BotManager {
 
     let lastLoggedMsgText = '';
 
-    this.bot.on('messagestr', (message, messagePosition) => {
+    this.bot.on('messagestr', (message, messagePosition, jsonMsg) => {
       if (!message || message.trim() === '') return;
       if (messagePosition === 'game_info' || messagePosition === 'actionbar') return;
       if (/❤|\bmana\b|\bstamina\b|\bhealth\b/i.test(message) && /\d+\/\d+/.test(message)) return;
@@ -802,7 +1034,9 @@ class BotManager {
       if (trimmed === lastLoggedMsgText) return;
       lastLoggedMsgText = trimmed;
 
-      this.addLog(trimmed, 'server');
+      let actions = null;
+      try { actions = extractChatActions(jsonMsg); } catch (e) { }
+      this.addLog(trimmed, 'server', actions);
     });
 
     this.bot.on('kicked', (reason) => {
@@ -1047,6 +1281,141 @@ class BotManager {
     }
   }
 
+  // Full spatial data (used for the snapshot a browser gets when it switches live data on)
+  getSpatialPayload() {
+    return {
+      botId: this.config.id,
+      position: this.position,
+      scoreboard: this.scoreboard,
+      inventory: this.inventory,
+      entities: this.nearbyEntities
+    };
+  }
+
+  // Runs a command taken from a clickable chat message (same as clicking it in the game)
+  runChatCommand(command) {
+    if (this.config.platform === 'bedrock') {
+      this.addLog('Klik pesan chat belum didukung untuk akun Bedrock.', 'warning');
+      return;
+    }
+    if (this.status !== 'online' || !this.bot) {
+      this.addLog(`Gagal menjalankan perintah: Bot (${this.config.username}) sedang offline!`, 'error');
+      return;
+    }
+    const cmd = typeof command === 'string' ? command.trim() : '';
+    if (!cmd.startsWith('/') || cmd.length > 200 || /[\r\n]/.test(cmd)) return;
+    try {
+      this.bot.chat(cmd);
+      this.addLog(`[KLIK CHAT] ${cmd}`, 'mychat');
+    } catch (err) {
+      this.addLog(`Gagal menjalankan ${cmd}: ${err.message}`, 'error');
+    }
+  }
+
+  // Re-read the scoreboard and log (once per change) where the data comes from, to help debugging
+  refreshScoreboard() {
+    if (!this.bot) return;
+    const sb = extractScoreboard(this.bot);
+    this.scoreboard = sb;
+    const sig = `${sb.source}|${sb.title}|${sb.items.length > 0}`;
+    if (sig !== this._scoreboardSig) {
+      this._scoreboardSig = sig;
+      const objectives = Object.keys(this.bot.scoreboards || {}).join(', ') || '-';
+      const sidebar = findSidebarObjective(this.bot);
+      this.addLog(`[SCOREBOARD] sumber=${sb.source} | judul="${sb.title}" | ${sb.items.length} baris | sidebar=${sidebar ? sidebar.name : '-'} | objective: ${objectives}`, 'system');
+    }
+  }
+
+  // Resolves true when the bot emits `eventName`, or false after `ms` milliseconds.
+  waitBotEvent(bot, eventName, ms) {
+    return new Promise((resolve) => {
+      let timer = null;
+      const onEvent = () => { clearTimeout(timer); resolve(true); };
+      timer = setTimeout(() => { bot.removeListener(eventName, onEvent); resolve(false); }, Math.max(0, ms));
+      bot.once(eventName, onEvent);
+    });
+  }
+
+  // Right-click an item from the inventory panel (e.g. a speed booster).
+  // The item is moved/selected into the held slot, used with a right click, then everything
+  // is put back so tools the bot relies on (pickaxe, rod, ...) stay where they were.
+  async useInventoryItem(slot) {
+    if (this.config.platform === 'bedrock') {
+      this.addLog('Klik kanan item belum didukung untuk akun Bedrock.', 'warning');
+      return;
+    }
+    if (this.status !== 'online' || !this.bot) {
+      this.addLog(`Gagal klik kanan: Bot (${this.config.username}) sedang offline!`, 'error');
+      return;
+    }
+    if (this.itemUseBusy) return;
+    if (this.bot.currentWindow) {
+      this.addLog('Gagal klik kanan: tutup GUI/container yang sedang terbuka dulu.', 'warning');
+      return;
+    }
+    // 9-35 = inventory utama, 36-44 = hotbar
+    if (!Number.isInteger(slot) || slot < 9 || slot > 44) return;
+
+    const bot = this.bot;
+    const item = bot.inventory.slots[slot];
+    if (!item) {
+      this.addLog(`Slot #${slot} kosong.`, 'warning');
+      return;
+    }
+
+    this.itemUseBusy = true;
+    const label = cleanMcText(item.displayName || item.name) || item.name;
+    const prevQuick = bot.quickBarSlot;
+    const heldSlot = 36 + prevQuick;
+    let swapped = false;
+
+    try {
+      if (slot >= 36) {
+        bot.setQuickBarSlot(slot - 36);
+      } else {
+        await bot.moveSlotItem(slot, heldSlot);
+        swapped = true;
+      }
+      await sleep(250);
+
+      // Register the listener first so a fast server response is not missed
+      const guiOpening = this.waitBotEvent(bot, 'windowOpen', 1500);
+      bot.activateItem();
+      this.addLog(`[KLIK KANAN] ${label} (slot #${slot})`, 'mychat');
+
+      // Some items (e.g. pet food) open a menu. The item must stay in hand while that menu is
+      // open, because the server reads the held item when a slot in the menu is clicked.
+      // Everything is put back only after the menu has been closed.
+      let guiOpened = await guiOpening;
+      if (guiOpened) {
+        this.addLog(`GUI terbuka. ${label} tetap dipegang sampai GUI ditutup (pilih slot di GUI dengan klik kiri).`, 'system');
+        const deadline = Date.now() + ITEM_GUI_MAX_WAIT_MS;
+        while (guiOpened && Date.now() < deadline) {
+          if (bot.currentWindow) await this.waitBotEvent(bot, 'windowClose', deadline - Date.now());
+          // some menus close and immediately open a follow-up menu
+          guiOpened = await this.waitBotEvent(bot, 'windowOpen', 800);
+        }
+        if (bot.currentWindow) {
+          try { bot.closeWindow(bot.currentWindow); } catch (e) { }
+          this.addLog('GUI ditutup otomatis karena terlalu lama tidak dipakai.', 'warning');
+        }
+        await sleep(400);
+      } else {
+        await sleep(400);
+      }
+    } catch (err) {
+      this.addLog(`Gagal klik kanan ${label}: ${err.message}`, 'error');
+    } finally {
+      try {
+        if (swapped) await bot.moveSlotItem(slot, heldSlot);
+        if (bot.quickBarSlot !== prevQuick) bot.setQuickBarSlot(prevQuick);
+      } catch (err) {
+        this.addLog(`Gagal mengembalikan item ke slot semula: ${err.message}`, 'error');
+      }
+      this.itemUseBusy = false;
+    }
+  }
+
   closeGui() {
     if (!this.bot || !this.bot.currentWindow) return;
     try {
@@ -1120,6 +1489,16 @@ app.get('/api/accounts', (req, res) => {
 
 // WebSocket Handlers
 io.on('connection', (socket) => {
+  socket.emit('quick-commands', quickCommands);
+  socket.on('update-quick-commands', (list) => {
+    quickCommands = sanitizeQuickCommands(list);
+    try {
+      fs.writeFileSync(QUICK_FILE, JSON.stringify(quickCommands, null, 2));
+    } catch (err) {
+      console.error('Gagal menyimpan quick_commands.json:', err.message);
+    }
+    io.emit('quick-commands', quickCommands);
+  });
   // If security is disabled, send init-multi directly once
   if (!securityConfig.enabled) {
     socket.emit('auth-status', { authenticated: true, securityEnabled: false });
@@ -1195,6 +1574,32 @@ io.on('connection', (socket) => {
     const { botId, slot } = payload || {};
     const bot = getBot(botId);
     if (bot && Number.isInteger(slot) && slot >= 0) bot.clickGuiSlot(slot);
+  });
+
+  // Live data switch: only browsers in the "live" room receive position/inventory/scoreboard updates
+  const sendSnapshot = () => {
+    Object.values(botInstances).forEach(b => socket.emit('bot-spatial-update', b.getSpatialPayload()));
+  };
+  socket.on('set-live', (enabled) => {
+    if (enabled) {
+      socket.join('live');
+      sendSnapshot();
+    } else {
+      socket.leave('live');
+    }
+  });
+  socket.on('request-snapshot', sendSnapshot);
+
+  socket.on('run-chat-command', (payload) => {
+    const { botId, command } = payload || {};
+    const bot = getBot(botId);
+    if (bot) bot.runChatCommand(command);
+  });
+
+  socket.on('use-item', (payload) => {
+    const { botId, slot } = payload || {};
+    const bot = getBot(botId);
+    if (bot && Number.isInteger(slot)) bot.useInventoryItem(slot);
   });
 
   socket.on('close-gui-modal', (botId) => {

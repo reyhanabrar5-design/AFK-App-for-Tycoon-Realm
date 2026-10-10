@@ -55,6 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const povYawPitch = document.getElementById('pov-yaw-pitch');
   const povDimension = document.getElementById('pov-dimension');
   const inventoryGridContainer = document.getElementById('inventory-grid-container');
+  if (inventoryGridContainer) inventoryGridContainer.addEventListener('contextmenu', (e) => e.preventDefault());
   const entitiesTableBody = document.getElementById('entities-table-body');
 
   const threeCanvas = document.getElementById('three-canvas');
@@ -78,6 +79,64 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   });
+
+  // ---- Custom quick buttons (global for all accounts, stored on the server) ----
+  let quickCommands = [];
+  let quickDraft = [];
+  const quickBar = document.querySelector('.quick-commands-bar');
+  const quickEditor = document.getElementById('quick-cmd-editor');
+
+  function renderQuickBar() {
+    if (!quickBar) return;
+    quickBar.querySelectorAll('.quick-cmd-btn.custom').forEach(el => el.remove());
+    quickCommands.forEach((q) => {
+      const btn = document.createElement('button');
+      btn.className = 'quick-cmd-btn custom';
+      btn.title = q.command;
+      const icon = document.createElement('i');
+      icon.className = 'fa-solid fa-bolt';
+      btn.appendChild(icon);
+      btn.appendChild(document.createTextNode(' ' + q.label));
+      btn.addEventListener('click', () => socket.emit('send-chat', { botId: activeBotId, message: q.command }));
+      quickBar.appendChild(btn);
+    });
+  }
+
+  function renderQuickEditor() {
+    if (!quickEditor) return;
+    quickEditor.innerHTML = '';
+    quickDraft.forEach((q, i) => {
+      const row = document.createElement('div');
+      row.className = 'quick-cmd-row';
+      const label = document.createElement('input');
+      label.type = 'text'; label.maxLength = 30; label.placeholder = 'Nama tombol';
+      label.value = q.label; label.addEventListener('input', () => { quickDraft[i].label = label.value; });
+      const cmd = document.createElement('input');
+      cmd.type = 'text'; cmd.maxLength = 256; cmd.placeholder = 'Perintah / pesan, misal: /wtb diamond 64';
+      cmd.value = q.command; cmd.addEventListener('input', () => { quickDraft[i].command = cmd.value; });
+      const del = document.createElement('button');
+      del.type = 'button'; del.className = 'btn btn-danger'; del.title = 'Hapus tombol';
+      del.innerHTML = '<i class="fa-solid fa-trash"></i>';
+      del.addEventListener('click', () => { quickDraft.splice(i, 1); renderQuickEditor(); });
+      row.appendChild(label); row.appendChild(cmd); row.appendChild(del);
+      quickEditor.appendChild(row);
+    });
+  }
+
+  socket.on('quick-commands', (list) => {
+    quickCommands = Array.isArray(list) ? list : [];
+    quickDraft = quickCommands.map(q => ({ label: q.label, command: q.command }));
+    renderQuickBar();
+    renderQuickEditor();
+  });
+  const btnAddQuick = document.getElementById('btn-add-quick-cmd');
+  const btnSaveQuick = document.getElementById('btn-save-quick-cmds');
+  if (btnAddQuick) btnAddQuick.addEventListener('click', () => {
+    if (quickDraft.length >= 12) return;
+    quickDraft.push({ label: '', command: '' });
+    renderQuickEditor();
+  });
+  if (btnSaveQuick) btnSaveQuick.addEventListener('click', () => socket.emit('update-quick-commands', quickDraft));
 
   let userClosedGui = false;
 
@@ -113,8 +172,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const tabSubtitle = document.getElementById('tab-subtitle');
 
   const tabInfoMap = {
-    dashboard: { title: 'Dashboard Multi-Bot AFK', subtitle: 'Kelola 4 akun Minecraft AFK, Scoreboard Sidebar & Tampilan Kamera 3D POV' },
-    pov: { title: 'Live 3D POV & World Radar', subtitle: 'Pantau kamera 3D pandangan mata karakter, kompas, inventory & entitas' },
+    dashboard: { title: 'Dashboard Multi-Bot AFK', subtitle: 'Kelola akun Minecraft AFK, Scoreboard Sidebar & Inventory' },
+    pov: { title: 'Radar & Inventory', subtitle: 'Pantau kompas, inventory & pemain di sekitar karakter' },
     settings: { title: 'Pengaturan Bot', subtitle: 'Kustomisasi koneksi dan skrip perintah otomatis tiap akun' }
   };
 
@@ -253,6 +312,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Socket Events
   socket.on('init-multi', (allStates) => {
+    lastSpatialAt = new Date(); // a fresh full state arrived
+    updateLiveLabel();
     botStates = {};
     if (Array.isArray(allStates)) {
       allStates.forEach(state => {
@@ -341,16 +402,49 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // ---- Live data switch (OFF = frozen on the last data, saves bandwidth) ----
+  let liveEnabled = false;
+  try { liveEnabled = localStorage.getItem('liveData') === '1'; } catch (e) { }
+  let lastSpatialAt = null;
+  const liveToggle = document.getElementById('live-toggle');
+  const liveText = document.getElementById('live-text');
+  const btnRefreshOnce = document.getElementById('btn-refresh-once');
+
+  function updateLiveLabel() {
+    if (!liveText) return;
+    liveText.textContent = liveEnabled
+      ? 'Live'
+      : (lastSpatialAt ? `Beku · ${lastSpatialAt.toLocaleTimeString('id-ID', { hour12: false })}` : 'Beku');
+    liveText.classList.toggle('on', liveEnabled);
+  }
+  function sendLiveState() { socket.emit('set-live', liveEnabled); }
+
+  if (liveToggle) {
+    liveToggle.checked = liveEnabled;
+    liveToggle.addEventListener('change', () => {
+      liveEnabled = liveToggle.checked;
+      try { localStorage.setItem('liveData', liveEnabled ? '1' : '0'); } catch (e) { }
+      sendLiveState();
+      updateLiveLabel();
+    });
+  }
+  if (btnRefreshOnce) btnRefreshOnce.addEventListener('click', () => socket.emit('request-snapshot'));
+  socket.on('connect', sendLiveState); // rooms are lost on reconnect, so announce the state again
+  updateLiveLabel();
+
   socket.on('bot-spatial-update', (data) => {
-    if (botStates[data.botId]) {
-      botStates[data.botId].position = data.position;
-      botStates[data.botId].scoreboard = data.scoreboard;
-      botStates[data.botId].inventory = data.inventory;
-      botStates[data.botId].entities = data.entities;
-      if (data.activeGui !== undefined) botStates[data.botId].activeGui = data.activeGui;
+    const st = botStates[data.botId];
+    if (st) {
+      // The server only sends the sections that changed, so keep the old value for the others
+      ['position', 'scoreboard', 'inventory', 'entities'].forEach((key) => {
+        if (data[key] !== undefined) st[key] = data[key];
+      });
+      if (data.activeGui !== undefined) st.activeGui = data.activeGui;
     }
-    if (data.botId === activeBotId) {
-      updateSpatialUI(data.position, data.scoreboard, data.inventory, data.entities);
+    lastSpatialAt = new Date();
+    updateLiveLabel();
+    if (st && data.botId === activeBotId) {
+      updateSpatialUI(st.position, st.scoreboard, st.inventory, st.entities);
       if (data.activeGui) renderGuiModal(data.activeGui);
     }
   });
@@ -980,7 +1074,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function cleanLineText(text) {
     if (!text) return '';
-    let str = String(text);
+    let str = stripCustomGlyphs(text);
     str = str.replace(/TAB-Sidebar-\d+/gi, '');
     str = str.replace(/TAB-\w+-\d+/gi, '');
     str = str.replace(/§[0-9a-fk-or]/gi, '');
@@ -1071,7 +1165,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Render Live Scoreboard HUD
-    const title = (scoreboard && scoreboard.title) ? cleanLineText(scoreboard.title) : 'Gens Tycoon 4th';
+    const title = (scoreboard && scoreboard.title) ? cleanLineText(scoreboard.title) : 'Scoreboard';
     if (scoreboardTitle) scoreboardTitle.textContent = title;
     if (povSbTitle) povSbTitle.textContent = title;
 
@@ -1175,24 +1269,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     for (let slotIdx = 0; slotIdx < 36; slotIdx++) {
-      const slotDiv = document.createElement('div');
-      const item = itemMap[slotIdx + 9] || itemMap[slotIdx];
-
+      const item = itemMap[slotIdx + 9]; // window slots 9-35 = tas, 36-44 = hotbar
+      let slotDiv;
       if (item) {
-        slotDiv.className = 'inventory-slot has-item';
-        const fullName = item.displayName || item.name;
-        const abbr = fullName;
-        const iconUrl = getItemTextureUrl(item.name, item.displayName);
-
-        slotDiv.innerHTML = `
-        <div class="item-icon-wrapper" title="${fullName}">
-          <img src="${iconUrl}" alt="${abbr}" class="item-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';" />
-          <span class="item-name-abbr fallback-abbr" style="display:none;">${abbr.substring(0, 8)}</span>
-          ${item.count > 1 ? `<span class="item-count-badge">${item.count}</span>` : ''}
-        </div>
-      `;
+        // Same slot renderer as the chest GUI (icon, count badge, tooltip), but not clickable
+        slotDiv = createGuiSlotElement(item, { readOnly: true });
       } else {
-        slotDiv.className = 'inventory-slot';
+        slotDiv = document.createElement('div');
+        slotDiv.className = 'gui-slot readonly';
       }
       inventoryGridContainer.appendChild(slotDiv);
     }
@@ -1222,7 +1306,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } else {
         entitiesTableBody.innerHTML = `
           <tr>
-            <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 1rem;">Mencari pemain dan entitas di sekitar bot...</td>
+            <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 1rem;">Mencari pemain di sekitar bot...</td>
           </tr>
         `;
       }
@@ -1299,7 +1383,8 @@ document.addEventListener('DOMContentLoaded', () => {
     moveMcTooltip(evt);
   }
 
-  function createGuiSlotElement(s) {
+  function createGuiSlotElement(s, opts) {
+    const readOnly = !!(opts && opts.readOnly);
     const slotDiv = document.createElement('div');
     if (!s) return slotDiv;
 
@@ -1315,8 +1400,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const isCover = rawName.includes('black') || rawName.includes('gray') || rawName.includes('purple') || rawDisp.includes('gacha') || rawDisp.includes('tutup') || rawDisp.includes('cover') || rawDisp.includes('locked');
 
     let slotClass = 'gui-slot';
-    if (isGreenGlass) slotClass += ' green-glass';
-    if (isCover) slotClass += ' cover-glass';
+    if (!readOnly && isGreenGlass) slotClass += ' green-glass';
+    if (!readOnly && isCover) slotClass += ' cover-glass';
+    if (readOnly) slotClass += ' readonly';
     slotDiv.className = slotClass;
 
     // Icon sources, in order: local inventory-style icon -> remote flat texture -> text label
@@ -1384,6 +1470,21 @@ document.addEventListener('DOMContentLoaded', () => {
       slotDiv.addEventListener('mouseenter', (evt) => showMcTooltip(s, evt));
       slotDiv.addEventListener('mousemove', moveMcTooltip);
       slotDiv.addEventListener('mouseleave', hideMcTooltip);
+    }
+
+    if (readOnly) {
+      // Inventory panel: right-click = use the item (e.g. a booster) on the bot
+      if (!isAir) {
+        slotDiv.addEventListener('contextmenu', (evt) => {
+          evt.preventDefault();
+          hideMcTooltip();
+          slotDiv.classList.remove('used');
+          void slotDiv.offsetWidth;
+          slotDiv.classList.add('used');
+          socket.emit('use-item', { botId: activeBotId, slot: s.slot });
+        });
+      }
+      return slotDiv;
     }
 
     slotDiv.addEventListener('click', () => {
@@ -1506,6 +1607,129 @@ document.addEventListener('DOMContentLoaded', () => {
     renderAutoCmdRows(cmds);
   }
 
+  // Badges from the server's resource pack are private-use characters: browsers have no picture for
+  // them (they show as boxes or "?"), so they are removed and the leftover spacing is tidied.
+  function stripCustomGlyphs(text) {
+    const str = String(text || '');
+    const cleaned = str
+      .replace(/[\uDB80-\uDBFF][\uDC00-\uDFFF]/g, '') // private use planes 15-16
+      .replace(/[\uE000-\uF8FF]/g, '')                 // private use area
+      .replace(/\uFFFD+/g, '');                         // undecodable characters
+    if (cleaned === str) return str;
+    return cleaned
+      .replace(/\[\s*\]/g, '')
+      .replace(/\[\s+/g, '[')
+      .replace(/\s+\]/g, ']')
+      .replace(/ {2,}/g, ' ')
+      .trim();
+  }
+
+  // Commands that only open a view (safe to run without asking). Anything else asks for confirmation.
+  const SAFE_CHAT_COMMAND = /^\/(chat(inv|item|ec)\s+[0-9a-f-]{36}$|(viewinv|invsee|inv|inventory|openinv|inspect|ec|enderchest)\b)/i;
+
+  function runChatAction(botId, command) {
+    if (!SAFE_CHAT_COMMAND.test(command) && !window.confirm(`Jalankan perintah ini di bot?\n\n${command}`)) return;
+    socket.emit('run-chat-command', { botId: botId || activeBotId, command });
+  }
+
+  // "[17][4][Scout] Name » message"  ->  badges / name / body
+  const CHAT_LINE = /^((?:\[[^\]]*\]\s*)+)([^\s»\[\]]+)\s*»\s*([\s\S]*)$/;
+
+  // Same player always gets the same colour
+  function nameColor(name) {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+    return `hsl(${h}, 70%, 72%)`;
+  }
+
+  // Shows a log line. Chat lines are split into badges, player name and message; clickable chat parts
+  // (e.g. "[Player's Inventory]") become links that run their command. Returns {sender, body}.
+  function renderLogMessage(spanMsg, log) {
+    const full = stripCustomGlyphs(log.message || '');
+    let rest = full;
+    let target = spanMsg;
+    let sender = null;
+
+    const m = (log.type === 'server' || log.type === 'chat') ? CHAT_LINE.exec(full) : null;
+    if (m) {
+      sender = m[2];
+      const badges = document.createElement('span');
+      badges.className = 'chat-badges';
+      badges.textContent = m[1].replace(/⊡/g, '').replace(/\s+/g, ' ').trim() + ' ';
+      const name = document.createElement('span');
+      name.className = 'chat-name';
+      name.style.color = nameColor(sender);
+      name.textContent = sender;
+      const sep = document.createElement('span');
+      sep.className = 'chat-sep';
+      sep.textContent = ' » ';
+      const body = document.createElement('span');
+      body.className = 'chat-body';
+      spanMsg.appendChild(badges);
+      spanMsg.appendChild(name);
+      spanMsg.appendChild(sep);
+      spanMsg.appendChild(body);
+      target = body;
+      rest = m[3];
+    }
+
+    if (!Array.isArray(log.actions) || log.actions.length === 0) {
+      target.textContent = rest;
+      return { sender, body: rest };
+    }
+    const bodyText = rest;
+    const unplaced = [];
+    const makeLink = (act, label) => {
+      const a = document.createElement('a');
+      a.className = 'chat-action';
+      a.href = '#';
+      a.textContent = label;
+      a.title = `Klik untuk menjalankan: ${act.command}`;
+      a.addEventListener('click', (evt) => {
+        evt.preventDefault();
+        runChatAction(log.botId, act.command);
+      });
+      return a;
+    };
+    log.actions.forEach((act) => {
+      const label = stripCustomGlyphs(act.text || '').trim();
+      const idx = label ? rest.indexOf(label) : -1;
+      if (idx >= 0) {
+        target.appendChild(document.createTextNode(rest.slice(0, idx)));
+        target.appendChild(makeLink(act, label));
+        rest = rest.slice(idx + label.length);
+      } else {
+        unplaced.push(act);
+      }
+    });
+    target.appendChild(document.createTextNode(rest));
+    unplaced.forEach((act) => {
+      target.appendChild(document.createTextNode(' '));
+      target.appendChild(makeLink(act, '[buka]'));
+    });
+    return { sender, body: bodyText };
+  }
+
+  // Extra classes so the CSS can tell chat, joins/leaves, announcements and mentions apart
+  function classifyLogLine(div, log, info) {
+    if (info.sender) {
+      div.classList.add('is-chat');
+      const st = botStates[log.botId];
+      const me = st && st.config && st.config.username ? String(st.config.username).toLowerCase() : '';
+      if (me) {
+        if (info.sender.toLowerCase() === me) div.classList.add('is-own');
+        else if (info.body.toLowerCase().includes(me)) div.classList.add('is-mention');
+      }
+      return;
+    }
+    if (log.type !== 'server') return;
+    const text = log.message || '';
+    div.classList.add('is-system');
+    if (/\bis connected\b/i.test(text)) div.classList.add('sys-join');
+    else if (/\bis disconnected\b/i.test(text)) div.classList.add('sys-leave');
+    else if (/^\S+ \| /.test(text)) div.classList.add('sys-announce');
+  }
+
   function appendLogEntry(log) {
     if (!log) return;
     const div = document.createElement('div');
@@ -1513,11 +1737,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const spanTime = document.createElement('span');
     spanTime.className = 'timestamp';
-    spanTime.textContent = `[${log.timestamp || ''}]`;
+    spanTime.textContent = (log.timestamp || '').replace(/\./g, ':');
 
     const spanMsg = document.createElement('span');
     spanMsg.className = 'log-msg';
-    spanMsg.textContent = log.message || '';
+    const info = renderLogMessage(spanMsg, log);
+    classifyLogLine(div, log, info);
 
     div.appendChild(spanTime);
     div.appendChild(spanMsg);
