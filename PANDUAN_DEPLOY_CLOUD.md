@@ -47,3 +47,27 @@ Dengan mengikuti panduan ini, aplikasi Web AFK Server Anda akan berjalan di Clou
 1. **Mulai / Hentikan Bot**: Tekan tombol **Mulai Bot** di pojok kanan atas.
 2. **Kirim Pesan / Command**: Ketik perintah seperti `/spawn` atau `/pay` di bar bagian bawah terminal live console.
 3. **Ubah Pengaturan**: Masuk ke menu **Pengaturan Bot** untuk mengubah Host Server (misal `alwination.id`), Port, Username, atau Fitur Anti-AFK.
+
+## Mengontrol dari PowerShell (tanpa membuka dashboard)
+
+Server aplikasi tetap harus berjalan, tetapi dashboard web tidak perlu dibuka. Di PowerShell, masuk ke folder proyek lalu jalankan:
+
+```powershell
+npm start
+```
+
+Buka jendela PowerShell kedua di folder yang sama dan jalankan:
+
+```powershell
+.\afk.ps1
+```
+
+Untuk server pada alamat lain, berikan URL server:
+
+```powershell
+.\afk.ps1 -ServerUrl https://your-server.example.com
+```
+
+CLI meminta kata sandi dashboard bila proteksi aktif. Gunakan HTTPS untuk koneksi ke server jarak jauh. Sesi dapat dikunci dan CLI ditutup dengan `logout` atau `exit`; token sesi tidak disimpan ke file. Ketik `help` di prompt `afk>` untuk daftar perintah. Fitur yang tersedia meliputi status, log, akun, mulai/hentikan bot, chat dan command, pengaturan koneksi dan auto-command, quick command, keamanan, inventory, scoreboard, entity, serta melihat dan mengklik slot GUI Minecraft.
+
+Radar/POV 3D dan tampilan grafis chest tidak dirender di terminal; informasi bot dan slot yang dapat digunakan ditampilkan sebagai teks. Server juga harus dapat dijangkau melalui HTTP dari komputer yang menjalankan PowerShell.

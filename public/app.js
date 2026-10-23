@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let botStates = {};
   let activeBotId = null;
+  let activeMsaBotId = null;
   let currentActiveGui = null;
   let lastRenderedGuiSig = '';
 
@@ -20,6 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const activeBotStatusText = document.getElementById('active-bot-status-text');
 
   const btnStartSingle = document.getElementById('btn-start-single');
+  const btnStartXbox = document.getElementById('btn-start-xbox');
   const btnStopSingle = document.getElementById('btn-stop-single');
   const btnStartAll = document.getElementById('btn-start-all');
   const btnStopAll = document.getElementById('btn-stop-all');
@@ -136,9 +138,75 @@ document.addEventListener('DOMContentLoaded', () => {
     quickDraft.push({ label: '', command: '' });
     renderQuickEditor();
   });
-  if (btnSaveQuick) btnSaveQuick.addEventListener('click', () => socket.emit('update-quick-commands', quickDraft));
+  const quickStatus = document.getElementById('quick-cmd-status');
+  let quickSaveTimer = null;
+  function setQuickStatus(text, color) {
+    if (!quickStatus) return;
+    quickStatus.textContent = text;
+    quickStatus.style.color = color || 'var(--text-muted)';
+  }
+  if (btnSaveQuick) btnSaveQuick.addEventListener('click', () => {
+    const valid = quickDraft.filter(q => (q.command || '').trim());
+    if (valid.length === 0 && quickDraft.length > 0) {
+      setQuickStatus('Isi perintah dulu sebelum menyimpan.', '#fca5a5');
+      return;
+    }
+    setQuickStatus('Menyimpan...');
+    clearTimeout(quickSaveTimer);
+    quickSaveTimer = setTimeout(() => {
+      setQuickStatus('Tidak ada respons dari server. Pastikan server.js terbaru sudah dipasang dan server sudah di-restart.', '#fca5a5');
+    }, 3000);
+    socket.emit('update-quick-commands', quickDraft);
+  });
+  socket.on('quick-commands', (list) => {
+    if (quickSaveTimer) {
+      clearTimeout(quickSaveTimer);
+      quickSaveTimer = null;
+      setQuickStatus(`✓ Tersimpan (${Array.isArray(list) ? list.length : 0} tombol)`, '#6ee7b7');
+    }
+  });
 
   let userClosedGui = false;
+  const guiMinimized = {}; // botId -> true when the user hid the GUI window but left it open on the bot
+  const btnMinGuiModal = document.getElementById('btn-min-gui-modal');
+  if (btnMinGuiModal) {
+    btnMinGuiModal.addEventListener('click', () => {
+      if (activeBotId) guiMinimized[activeBotId] = true;
+      if (guiModal) guiModal.classList.add('hidden');
+      renderGuiDock();
+    });
+  }
+
+  // Small chips (bottom-left) for accounts whose GUI is open but not shown, e.g. the trade partner
+  function renderGuiDock() {
+    let dock = document.getElementById('gui-dock');
+    if (!dock) {
+      dock = document.createElement('div');
+      dock.id = 'gui-dock';
+      document.body.appendChild(dock);
+    }
+    dock.innerHTML = '';
+    Object.keys(botStates).forEach((id) => {
+      const st = botStates[id];
+      if (!st || !st.activeGui) return;
+      if (id === activeBotId && !guiMinimized[id]) return; // already visible
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'gui-dock-chip';
+      const dot = document.createElement('span');
+      dot.className = 'gui-dock-dot';
+      chip.appendChild(dot);
+      chip.appendChild(document.createTextNode(` ${st.config.username}: ${stripCustomGlyphs(st.activeGui.title || 'GUI')}`));
+      chip.addEventListener('click', () => {
+        guiMinimized[id] = false;
+        activeBotId = id;
+        renderAccountTabs();
+        renderActiveBotUI();
+      });
+      dock.appendChild(chip);
+    });
+  }
+
 
   // Modal toggle
   if (btnOpenGuiModal) {
@@ -355,6 +423,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const msaLink = document.getElementById('msa-verification-link');
     const btnCopyMsa = document.getElementById('btn-copy-msa-code');
 
+    activeMsaBotId = data.botId;
     if (msaCodeVal) msaCodeVal.textContent = data.userCode || '--------';
     if (msaLink && data.verificationUri) {
       msaLink.href = data.verificationUri;
@@ -370,11 +439,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  socket.on('bot-msa-authenticated', (data) => {
+    if (!data || data.botId !== activeMsaBotId) return;
+    const msaModal = document.getElementById('msa-code-modal');
+    if (msaModal) msaModal.classList.add('hidden');
+    activeMsaBotId = null;
+  });
+
   const btnCloseMsaModal = document.getElementById('btn-close-msa-modal');
   if (btnCloseMsaModal) {
     btnCloseMsaModal.addEventListener('click', () => {
       const msaModal = document.getElementById('msa-code-modal');
       if (msaModal) msaModal.classList.add('hidden');
+      activeMsaBotId = null;
     });
   }
 
@@ -451,22 +528,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
   socket.on('bot-gui-open', (data) => {
     userClosedGui = false;
-    if (botStates[data.botId]) {
-      botStates[data.botId].activeGui = data.gui;
-    }
+    const st = botStates[data.botId];
+    // A brand-new window pops up again; updates to an open window keep it hidden if the user hid it
+    if (!(st && st.activeGui)) guiMinimized[data.botId] = false;
+    if (st) st.activeGui = data.gui;
     if (data.botId === activeBotId) {
       renderGuiModal(data.gui);
     }
+    renderAccountTabs();
   });
 
   socket.on('bot-gui-close', (data) => {
     userClosedGui = false;
+    guiMinimized[data.botId] = false;
     if (botStates[data.botId]) {
       botStates[data.botId].activeGui = null;
     }
     if (data.botId === activeBotId) {
       closeGuiModalUI();
     }
+    renderAccountTabs();
   });
 
   socket.on('bot-log', (data) => {
@@ -493,6 +574,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Action Buttons
   btnStartSingle.addEventListener('click', () => socket.emit('start-bot', activeBotId));
+  if (btnStartXbox) {
+    btnStartXbox.addEventListener('click', () => {
+      if (activeBotId) socket.emit('start-bot', { botId: activeBotId, auth: 'microsoft' });
+    });
+  }
   btnStopSingle.addEventListener('click', () => socket.emit('stop-bot', activeBotId));
   btnStartAll.addEventListener('click', () => socket.emit('start-all-bots'));
   btnStopAll.addEventListener('click', () => socket.emit('stop-all-bots'));
@@ -996,6 +1082,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <span class="account-tab-name">${state.config.username}</span>
         ${authIcon}
       `;
+      if (state.activeGui) tab.classList.add('has-gui');
       tab.addEventListener('click', () => {
         activeBotId = botId;
         renderAccountTabs();
@@ -1010,6 +1097,7 @@ document.addEventListener('DOMContentLoaded', () => {
     addBtn.innerHTML = `<i class="fa-solid fa-plus"></i> <span>Tambah Akun</span>`;
     addBtn.addEventListener('click', openAddAccountModal);
     accountTabsContainer.appendChild(addBtn);
+    renderGuiDock();
   }
 
 
@@ -1033,14 +1121,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (state.status === 'online') {
       btnStartSingle.style.display = 'none';
+      if (btnStartXbox) btnStartXbox.style.display = 'none';
       btnStopSingle.style.display = 'inline-flex';
       if (viewerOverlayMsg) viewerOverlayMsg.classList.add('hidden');
     } else if (state.status === 'connecting') {
       btnStartSingle.style.display = 'none';
+      if (btnStartXbox) btnStartXbox.style.display = 'none';
       btnStopSingle.style.display = 'inline-flex';
       if (viewerOverlayMsg) viewerOverlayMsg.classList.remove('hidden');
     } else {
       btnStartSingle.style.display = 'inline-flex';
+      if (btnStartXbox) btnStartXbox.style.display = cfg.platform === 'bedrock' ? 'inline-flex' : 'none';
       btnStopSingle.style.display = 'none';
       if (viewerOverlayMsg) viewerOverlayMsg.classList.remove('hidden');
     }
@@ -1383,6 +1474,45 @@ document.addEventListener('DOMContentLoaded', () => {
     moveMcTooltip(evt);
   }
 
+  // ---- Using an inventory item: right-click (mouse) or tap + "Gunakan" (touch) ----
+  let lastPointerType = 'mouse';
+  document.addEventListener('pointerdown', (e) => { lastPointerType = e.pointerType || 'mouse'; }, true);
+
+  function useInventorySlot(slot, slotDiv) {
+    if (slotDiv) {
+      slotDiv.classList.remove('used');
+      void slotDiv.offsetWidth;
+      slotDiv.classList.add('used');
+    }
+    socket.emit('use-item', { botId: activeBotId, slot });
+  }
+
+  let slotSheet = null;
+  let slotSheetTimer = null;
+  function hideSlotSheet() {
+    clearTimeout(slotSheetTimer);
+    if (slotSheet) slotSheet.classList.remove('show');
+  }
+  function showSlotSheet(item) {
+    if (!slotSheet) {
+      slotSheet = document.createElement('div');
+      slotSheet.id = 'slot-action-sheet';
+      slotSheet.innerHTML = '<span class="sheet-name"></span><button type="button" class="sheet-use">Gunakan</button><button type="button" class="sheet-cancel" aria-label="Batal">&times;</button>';
+      document.body.appendChild(slotSheet);
+      slotSheet.querySelector('.sheet-cancel').addEventListener('click', hideSlotSheet);
+      document.addEventListener('pointerdown', (e) => {
+        if (slotSheet.classList.contains('show') && !slotSheet.contains(e.target) && !e.target.closest('.mc-inventory-grid')) hideSlotSheet();
+      }, true);
+    }
+    const label = stripCustomGlyphs(item.customName || item.displayName || item.name || 'Item');
+    slotSheet.querySelector('.sheet-name').textContent = `${label}${item.count > 1 ? ' ×' + item.count : ''}`;
+    const useBtn = slotSheet.querySelector('.sheet-use');
+    useBtn.onclick = () => { useInventorySlot(item.slot, null); hideSlotSheet(); };
+    slotSheet.classList.add('show');
+    clearTimeout(slotSheetTimer);
+    slotSheetTimer = setTimeout(hideSlotSheet, 10000);
+  }
+
   function createGuiSlotElement(s, opts) {
     const readOnly = !!(opts && opts.readOnly);
     const slotDiv = document.createElement('div');
@@ -1473,15 +1603,17 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (readOnly) {
-      // Inventory panel: right-click = use the item (e.g. a booster) on the bot
+      // Inventory panel: mouse = right-click uses the item; touch/pen = tap opens a "Gunakan" button
       if (!isAir) {
         slotDiv.addEventListener('contextmenu', (evt) => {
           evt.preventDefault();
+          if (lastPointerType !== 'mouse') return; // long-press on a phone must not use the item by accident
           hideMcTooltip();
-          slotDiv.classList.remove('used');
-          void slotDiv.offsetWidth;
-          slotDiv.classList.add('used');
-          socket.emit('use-item', { botId: activeBotId, slot: s.slot });
+          useInventorySlot(s.slot, slotDiv);
+        });
+        slotDiv.addEventListener('click', () => {
+          if (lastPointerType === 'mouse') return;
+          showSlotSheet(s);
         });
       }
       return slotDiv;
@@ -1512,7 +1644,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (guiModalTitle) guiModalTitle.textContent = gui.title || 'Chest GUI';
-    if (guiModal && !userClosedGui) guiModal.classList.remove('hidden');
+    if (guiModal) {
+      if (guiMinimized[activeBotId]) guiModal.classList.add('hidden');
+      else if (!userClosedGui) guiModal.classList.remove('hidden');
+    }
 
     const chestGridContainer = document.getElementById('chest-grid-container');
     const inventoryGuiGrid = document.getElementById('inventory-gui-grid');

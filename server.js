@@ -38,8 +38,114 @@ const http = require('http');
 const { Server } = require('socket.io');
 const mineflayer = require('mineflayer');
 const { Vec3 } = require('vec3');
+const { Authflow: MicrosoftAuthflow, Titles: MicrosoftTitles } = require('prismarine-auth');
 const path = require('path');
 const fs = require('fs');
+const dns = require('dns').promises;
+
+const msaAuthRequests = new Map();
+let nextMicrosoftAuthFlowId = 1;
+
+async function pollMicrosoftDeviceCode(tokenManager, deviceCodeCallback) {
+  const acquiredAt = Date.now();
+  const deviceResponse = await fetch('https://login.live.com/oauth20_connect.srf', {
+    method: 'POST',
+    body: new URLSearchParams({
+      scope: tokenManager.scopes,
+      client_id: tokenManager.clientId,
+      response_type: 'device_code'
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  });
+  const device = await deviceResponse.json();
+  if (!deviceResponse.ok || device.error) {
+    const error = new Error(`Microsoft device-code request failed (${device.error || deviceResponse.status}): ${device.error_description || deviceResponse.statusText}`);
+    error.code = 'MSA_DEVICE_AUTH_FAILED';
+    throw error;
+  }
+  if (deviceResponse.headers.get('set-cookie')) {
+    const [cookie] = deviceResponse.headers.get('set-cookie').split(';');
+    device.cookie = cookie;
+  }
+  device.message = `To sign in, use a web browser to open the page ${device.verification_uri} and use the code ${device.user_code} or visit http://microsoft.com/link?otc=${device.user_code}`;
+  deviceCodeCallback(device);
+
+  const expiresAt = acquiredAt + (device.expires_in * 1000) - 100;
+  let intervalMs = device.interval * 1000;
+  while (Date.now() < expiresAt) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    const response = await fetch(`https://login.live.com/oauth20_token.srf?client_id=${encodeURIComponent(tokenManager.clientId)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(device.cookie ? { Cookie: device.cookie } : {})
+      },
+      body: new URLSearchParams({
+        client_id: tokenManager.clientId,
+        device_code: device.device_code,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
+      }).toString()
+    });
+    const result = await response.json();
+    if (result.error === 'authorization_pending') continue;
+    if (result.error === 'slow_down') {
+      intervalMs += 5000;
+      continue;
+    }
+    if (!response.ok || result.error) {
+      const error = new Error(`Microsoft device-code authorization failed (${result.error || response.status}): ${result.error_description || response.statusText}`);
+      error.code = 'MSA_DEVICE_AUTH_FAILED';
+      throw error;
+    }
+    await tokenManager.updateCache(result);
+    return { accessToken: result.access_token };
+  }
+
+  const error = new Error('Microsoft device-code authorization expired before a token was returned.');
+  error.code = 'MSA_DEVICE_AUTH_EXPIRED';
+  throw error;
+}
+
+class BedrockMicrosoftAuthflow extends MicrosoftAuthflow {
+  constructor(username, cache, options, codeCallback) {
+    const flowId = nextMicrosoftAuthFlowId++;
+    super(username, cache, options, (data) => {
+      console.info(`[Microsoft auth #${flowId}] Device-code flow started (code hidden).`);
+      if (codeCallback) codeCallback(data);
+    });
+    const normalizedUsername = String(username || '').trim().toLowerCase();
+    this.msaAuthKey = normalizedUsername
+      ? `username:${normalizedUsername}`
+      : `cache:${typeof cache === 'string' ? path.resolve(cache) : flowId}`;
+    this.msaAuthFlowId = flowId;
+    this.msaTerminalError = null;
+    this.msa.authDeviceCode = (callback) => pollMicrosoftDeviceCode(this.msa, callback);
+  }
+
+  getMsaToken() {
+    if (this.msaTerminalError) return Promise.reject(this.msaTerminalError);
+
+    const key = this.msaAuthKey;
+    const existingRequest = msaAuthRequests.get(key);
+    if (existingRequest) {
+      console.info(`[Microsoft auth #${this.msaAuthFlowId}] MSA request joined active flow #${existingRequest.flowId}.`);
+      return existingRequest.promise;
+    }
+
+    const request = super.getMsaToken().catch((error) => {
+      if (error && String(error.code || '').startsWith('MSA_DEVICE_AUTH_')) {
+        this.msaTerminalError = error;
+      }
+      throw error;
+    });
+    const requestEntry = { flowId: this.msaAuthFlowId, promise: request };
+    msaAuthRequests.set(key, requestEntry);
+    console.info(`[Microsoft auth #${this.msaAuthFlowId}] MSA request started; active account requests: ${msaAuthRequests.size}.`);
+    return request.finally(() => {
+      if (msaAuthRequests.get(key) === requestEntry) msaAuthRequests.delete(key);
+    });
+  }
+}
 
 let mineflayerViewer = null;
 try {
@@ -112,6 +218,7 @@ const VERIFY_RULES = [
 ];
 const SPATIAL_INTERVAL_MS = 2000; // how often position/inventory/scoreboard are checked for changes
 const ITEM_GUI_MAX_WAIT_MS = 90000; // how long an item stays in hand while its menu is open
+const BEDROCK_LOGIN_RESPONSE_TIMEOUT_MS = 30000;
 
 const defaultAccounts = [];
 
@@ -482,10 +589,97 @@ function extractScoreboard(bot) {
   return { title: titleStr, items: [], source: 'none' };
 }
 
+function formatBedrockConnectionError(error, auth) {
+  const message = String(error && error.message ? error.message : error || 'Kesalahan koneksi tidak diketahui.');
+  if (auth === 'microsoft' && error && error.code === 'MSA_DEVICE_AUTH_FAILED') {
+    return `Microsoft menolak penerbitan token Device Code: ${message}`;
+  }
+  if (auth === 'microsoft' && error && error.code === 'MSA_DEVICE_AUTH_EXPIRED') {
+    return 'Kode login Microsoft kedaluwarsa sebelum token diterima. Mulai satu percobaan login baru dan selesaikan persetujuan sebelum kode kedaluwarsa.';
+  }
+  if (auth === 'microsoft' && /Authentication failed, timed out|invalid_grant|device_code.*already been used/i.test(message)) {
+    return 'Login Microsoft gagal karena kode perangkat sudah dipakai atau kedaluwarsa. Pastikan hanya satu proses aplikasi dan satu percobaan login yang aktif, lalu mulai ulang bot dengan Xbox dan setujui satu kode terbaru saja.';
+  }
+  if (auth === 'microsoft' && (/\b401\s+Unauthorized\b/i.test(message) || /\bUNAUTHORIZED\b/i.test(message))) {
+    return 'Autentikasi Xbox/Microsoft ditolak oleh layanan Minecraft (401 Unauthorized). Pastikan akun ini dapat login ke Minecraft Bedrock dan memiliki akses/lisensi yang aktif; profil Xbox saja tidak cukup.';
+  }
+  return `Eror koneksi Bedrock: ${message}`;
+}
+
+function isTerminalMicrosoftAuthError(error) {
+  return Boolean(error && typeof error.code === 'string' && error.code.startsWith('MSA_DEVICE_AUTH_'));
+}
+
+function formatRaknetDisconnect(reason) {
+  if (reason === undefined || reason === null) {
+    return 'Backend RakNet menutup koneksi tanpa memberikan detail alasan.';
+  }
+  if (typeof reason === 'string') return reason;
+  if (reason instanceof Error) return `${reason.name}: ${reason.message}`;
+  try {
+    return JSON.stringify(reason);
+  } catch (err) {
+    return String(reason);
+  }
+}
+
+// ---- Bedrock helpers (follow the bedrock-protocol docs: docs/API.md) ----
+// Slash commands must be sent as "command_request" (not as chat text). Two fields depend on the version:
+//   <= 1.21.124 : version is a varint, a "player" origin has no player_entity_id
+//   >= 1.21.130 : version is a string ('latest'), player_entity_id (li64) is required
+function bedrockUsesNewCommandFormat(versionStr) {
+  const [major, minor, patch] = String(versionStr || '').split('.').map(Number);
+  if (!major) return true; // unknown version: assume current format
+  return major > 1 || minor > 21 || (minor === 21 && (patch || 0) >= 130);
+}
+function buildBedrockCommand(versionStr, command) {
+  const origin = { type: 'player', uuid: require('crypto').randomUUID(), request_id: '' };
+  if (bedrockUsesNewCommandFormat(versionStr)) {
+    origin.player_entity_id = 0n;
+    return { command, origin, internal: false, version: 'latest' };
+  }
+  return { command, origin, internal: false, version: 52 };
+}
+// Plain chat. "filtered_message" is required by the protocol on 1.21.0 - 1.21.124.
+function buildBedrockChat(sourceName, message) {
+  return { type: 'chat', needs_translation: false, source_name: sourceName, xuid: '', platform_chat_id: '', filtered_message: '', message };
+}
+const BEDROCK_TRANSLATIONS = {
+  'multiplayer.player.joined': (p) => `${p[0]} joined the game`,
+  'multiplayer.player.left': (p) => `${p[0]} left the game`,
+  'chat.type.text': (p) => `${p[0]} » ${p[1] || ''}`,
+  'chat.type.announcement': (p) => `[${p[0]}] ${p[1] || ''}`
+};
+// Text of a Bedrock "text" packet for the console: chat shows "Name » message", translations are expanded
+function formatBedrockText(packet) {
+  if (!packet) return '';
+  if (packet.type === 'translation') {
+    const key = String(packet.message || '').replace(/^%/, '');
+    const params = Array.isArray(packet.parameters) ? packet.parameters.map(x => cleanMcText(String(x))) : [];
+    return BEDROCK_TRANSLATIONS[key] ? BEDROCK_TRANSLATIONS[key](params) : [key, ...params].join(' ').trim();
+  }
+  const message = String(packet.message || '');
+  const isChat = packet.type === 'chat' || packet.type === 'whisper';
+  const name = String(packet.source_name || '');
+  if (isChat && name && !message.toLowerCase().includes(name.toLowerCase())) return `${name} » ${message}`;
+  return message || name;
+}
+// True when a move_player packet is about this bot (the packet is also sent for other players)
+function isOwnMovePacket(client, packet) {
+  try {
+    const ownId = client.entityId;
+    return ownId !== undefined && String(packet.runtime_id) === String(ownId);
+  } catch (e) {
+    return false;
+  }
+}
+
 // Bot Instance Manager class
 class BotManager {
   constructor(config) {
     this.config = config;
+    this.sessionAuth = config.auth === 'microsoft' ? 'microsoft' : 'offline';
+    this.bedrockAuthFailureMessage = null;
     this.bot = null;
     this.status = 'offline';
     this.health = { health: 20, food: 20 };
@@ -546,6 +740,10 @@ class BotManager {
   // Sends `cmd` and resolves true once the server confirmed it (see VERIFY_RULES), false on timeout
   sendAndVerify(cmd, rule) {
     const bot = this.bot;
+    if (typeof bot.on !== 'function') { // not a mineflayer bot: just send
+      try { bot.chat(cmd); } catch (e) { return Promise.resolve(false); }
+      return Promise.resolve(true);
+    }
     const startPos = bot.entity ? bot.entity.position.clone() : null;
     return new Promise((resolve) => {
       let settled = false;
@@ -626,7 +824,8 @@ class BotManager {
     this.addLog('Menjalankan Perintah Otomatis (Dengan Jeda Kustom)...', 'system');
 
     const alive = () => this._scriptRun === runId && this.bot && this.status === 'online';
-    const verify = this.config.verifyCommands !== false;
+    // Bedrock accounts have no mineflayer events to confirm against, so their commands are sent without verification
+    const verify = this.config.verifyCommands !== false && this.config.platform !== 'bedrock';
     const mask = (text) => (this.config.password ? text.split(this.config.password).join('***') : text);
 
     // Commands run one after another: each delay starts when the previous command is finished/confirmed
@@ -812,11 +1011,16 @@ class BotManager {
     }
   }
 
-  start() {
+  start(authOverride) {
     if (this.status === 'connecting' || this.status === 'online') {
       this.addLog('Bot sudah berjalan atau sedang terhubung.', 'warning');
       return;
     }
+
+    this.sessionAuth = authOverride === 'microsoft' || authOverride === 'offline'
+      ? authOverride
+      : (this.config.auth === 'microsoft' ? 'microsoft' : 'offline');
+    this.bedrockAuthFailureMessage = null;
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -827,7 +1031,12 @@ class BotManager {
     this.addLog(`Menghubungkan bot (${this.config.username}) ke ${this.config.host}:${this.config.port}...`, 'system');
 
     if (this.config.platform === 'bedrock') {
-      this.startBedrockBot();
+      this.addLog(`Metode login Bedrock untuk sesi ini: ${this.sessionAuth === 'microsoft' ? 'Xbox/Microsoft' : 'Offline'}.`, 'system');
+      this.startBedrockBot().catch((err) => {
+        this.addLog(`Gagal menyiapkan koneksi Bedrock: ${err.message}`, 'error');
+        this.updateStatus('error', err.message);
+        this.scheduleReconnect();
+      });
       return;
     }
 
@@ -846,6 +1055,10 @@ class BotManager {
     if (this.config.auth === 'microsoft') {
       options.profilesFolder = path.join(AUTH_CACHE_DIR, this.config.id);
       options.onMsaCode = (data) => {
+        pendingMsaCodes.set(this.config.id, {
+          userCode: data.user_code,
+          verificationUri: data.verification_uri
+        });
         const msg = `🔐 KODE LOGIN MICROSOFT: Buka ${data.verification_uri} dan masukkan kode: ${data.user_code}`;
         this.addLog(msg, 'warning');
         io.emit('bot-msa-code', {
@@ -896,6 +1109,7 @@ class BotManager {
     }
 
     this.bot.once('login', () => {
+      pendingMsaCodes.delete(this.config.id);
       this.addLog(`Berhasil Login ke server ${this.config.host}!`, 'success');
     });
 
@@ -1064,6 +1278,7 @@ class BotManager {
   }
 
   cleanup() {
+    this._bedrockAttempt = (this._bedrockAttempt || 0) + 1;
     this.stopScript();
     this.stopSpatialBroadcast();
     this.activeGuiWindow = null;
@@ -1096,16 +1311,33 @@ class BotManager {
     }
   }
 
-  startBedrockBot() {
+  async startBedrockBot() {
     if (!bedrockProtocol) {
       this.addLog('Modul bedrock-protocol tidak tersedia.', 'error');
       this.updateStatus('error', 'bedrock-protocol missing');
       return;
     }
 
+    const attemptId = (this._bedrockAttempt || 0) + 1;
+    this._bedrockAttempt = attemptId;
     this.updateStatus('connecting', 'Menghubungkan ke server Bedrock...');
     const bedrockPort = parseInt(this.config.port) || 19132;
     this.addLog(`Menghubungkan bot Bedrock (${this.config.username}) ke ${this.config.host}:${bedrockPort}...`, 'system');
+
+    let bedrockHost;
+    try {
+      const resolved = await dns.lookup(this.config.host, { family: 4 });
+      bedrockHost = resolved.address;
+      this.addLog(`[Bedrock] Host ${this.config.host} di-resolve ke IPv4 ${bedrockHost} untuk transport RakNet.`, 'system');
+    } catch (err) {
+      if (this._bedrockAttempt !== attemptId) return;
+      const message = `Gagal mencari alamat IPv4 server Bedrock (${this.config.host}): ${err.message}`;
+      this.addLog(message, 'error');
+      this.updateStatus('error', message);
+      this.scheduleReconnect();
+      return;
+    }
+    if (this._bedrockAttempt !== attemptId || this.status !== 'connecting') return;
 
     const AUTH_CACHE_DIR = path.join(__dirname, 'auth_cache');
     if (!fs.existsSync(AUTH_CACHE_DIR)) {
@@ -1113,13 +1345,20 @@ class BotManager {
     }
 
     const options = {
-      host: this.config.host,
+      host: bedrockHost,
       port: bedrockPort,
       username: this.config.username,
-      offline: this.config.auth !== 'microsoft',
-      raknetBackend: 'jsp-raknet',
+      offline: this.sessionAuth !== 'microsoft',
+      raknetBackend: 'raknet-node',
+      connectTimeout: 20000,
+      // connection steps (server found, version, port, refused/closed) are shown in the dashboard log
+      conLog: (msg) => this.addLog(`[Bedrock] ${msg}`, 'system'),
       profilesFolder: path.join(AUTH_CACHE_DIR, this.config.id),
       onMsaCode: (data) => {
+        pendingMsaCodes.set(this.config.id, {
+          userCode: data.user_code,
+          verificationUri: data.verification_uri
+        });
         const msg = `🔐 KODE LOGIN MICROSOFT BEDROCK: Buka ${data.verification_uri} dan masukkan kode: ${data.user_code}`;
         this.addLog(msg, 'warning');
         io.emit('bot-msa-code', {
@@ -1130,6 +1369,20 @@ class BotManager {
         });
       }
     };
+
+    if (this.sessionAuth === 'microsoft') {
+      options.authflow = new BedrockMicrosoftAuthflow(
+        this.config.username,
+        options.profilesFolder,
+        {
+          flow: 'live',
+          authTitle: MicrosoftTitles.MinecraftNintendoSwitch,
+          deviceType: 'Nintendo'
+        },
+        options.onMsaCode
+      );
+      this.addLog('[Bedrock] Perlindungan polling autentikasi Microsoft aktif untuk mencegah permintaan device-code ganda pada akun yang sama.', 'system');
+    }
 
     try {
       this.bedrockClient = bedrockProtocol.createClient(options);
@@ -1147,8 +1400,79 @@ class BotManager {
     }
 
     const client = this.bedrockClient;
+    const connectionStartedAt = Date.now();
+    let connectionPhase = 'menyiapkan sesi';
+    let clientStatus = 'belum mulai';
+    let lastServerPacket = 'belum ada';
+    let raknetDisconnectLogged = false;
+    let loginResponseTimer = null;
+
+    client.on('session', () => {
+      if (this.bedrockClient !== client || this.sessionAuth !== 'microsoft') return;
+      pendingMsaCodes.delete(this.config.id);
+      io.emit('bot-msa-authenticated', { botId: this.config.id });
+    });
+
+    client.once('connect_allowed', () => {
+      if (this.bedrockClient !== client) return;
+      this.addLog('[Bedrock] Server ditemukan; menyiapkan sesi autentikasi. Handshake RakNet dimulai setelah sesi siap.', 'system');
+      const raknet = client.connection && client.connection.raknet;
+      if (raknet && typeof raknet.once === 'function') {
+        raknet.once('connect', (info) => {
+          if (this.bedrockClient !== client) return;
+          connectionPhase = 'menunggu paket jaringan server';
+          this.addLog(`[Bedrock] Transport RakNet terhubung${info && info.address ? ` ke ${info.address}` : ''}.`, 'system');
+        });
+        raknet.once('disconnect', (reason) => {
+          if (this.bedrockClient !== client) return;
+          raknetDisconnectLogged = true;
+          this.addLog(`[Bedrock] Detail disconnect dari backend RakNet: ${formatRaknetDisconnect(reason)}`, 'warning');
+        });
+        raknet.once('error', (err) => {
+          if (this.bedrockClient !== client) return;
+          this.addLog(`[Bedrock] Error dari backend RakNet: ${formatRaknetDisconnect(err)}`, 'error');
+        });
+      }
+    });
+
+    client.on('status', (status) => {
+      if (this.bedrockClient !== client) return;
+      const statusNames = ['terputus', 'menghubungkan transport', 'autentikasi/login', 'inisialisasi dunia', 'sudah masuk dunia'];
+      clientStatus = statusNames[status] || `status ${status}`;
+      if (status === 2) {
+        connectionPhase = 'menunggu respons login server';
+        if (!loginResponseTimer) {
+          loginResponseTimer = setTimeout(() => {
+            loginResponseTimer = null;
+            if (this.bedrockClient !== client || client.status !== 2) return;
+            const message = `Server tidak membalas login Bedrock dalam ${BEDROCK_LOGIN_RESPONSE_TIMEOUT_MS / 1000} detik setelah network_settings. Periksa kecocokan protokol dan apakah server mengizinkan jenis autentikasi akun ini.`;
+            this.addLog(message, 'error');
+            this.updateStatus('error', message);
+            client.close();
+          }, BEDROCK_LOGIN_RESPONSE_TIMEOUT_MS);
+        }
+      }
+      else if (status === 1) connectionPhase = 'handshake RakNet';
+      else if (status === 3) connectionPhase = 'inisialisasi dunia';
+      else if (status === 4) connectionPhase = 'sudah masuk dunia';
+      this.addLog(`[Bedrock] Status protokol: ${clientStatus}.`, 'system');
+    });
+
+    client.on('packet', (packet) => {
+      if (this.bedrockClient !== client) return;
+      const packetName = packet && packet.data && packet.data.name;
+      if (!packetName) return;
+      lastServerPacket = packetName;
+      if (['network_settings', 'play_status', 'server_to_client_handshake', 'disconnect', 'resource_packs_info', 'start_game'].includes(packetName)) {
+        this.addLog(`[Bedrock] Paket server diterima: ${packetName}.`, packetName === 'disconnect' ? 'warning' : 'system');
+      }
+    });
 
     client.once('join', () => {
+      if (this.bedrockClient !== client) return;
+      clearTimeout(loginResponseTimer);
+      loginResponseTimer = null;
+      connectionPhase = 'login ke server';
       this.addLog(`Berhasil Login ke server Bedrock ${this.config.host}!`, 'success');
       this.updateStatus('online', 'Online di Bedrock World');
       this.startSpatialBroadcast();
@@ -1156,6 +1480,8 @@ class BotManager {
     });
 
     client.once('spawn', () => {
+      if (this.bedrockClient !== client) return;
+      connectionPhase = 'memuat dunia';
       this.updateStatus('online', 'Bot Online & Spawning');
       this.addLog(`Bot Bedrock (${this.config.username}) berhasil masuk ke game world!`, 'success');
     });
@@ -1170,29 +1496,40 @@ class BotManager {
       }
     });
 
+    // Own start position and dimension
+    client.on('start_game', (packet) => {
+      if (!packet || !packet.player_position) return;
+      const pos = packet.player_position;
+      this.position = {
+        x: Math.round(pos.x * 10) / 10,
+        y: Math.round(pos.y * 10) / 10,
+        z: Math.round(pos.z * 10) / 10,
+        yaw: 0,
+        pitch: 0,
+        dimension: typeof packet.dimension === 'string' ? packet.dimension : 'overworld'
+      };
+      if (this.bot && this.bot.entity) this.bot.entity.position = new Vec3(pos.x, pos.y, pos.z);
+    });
+
     client.on('move_player', (packet) => {
-      if (packet && packet.position) {
-        this.position = {
-          x: Math.round(packet.position.x * 10) / 10,
-          y: Math.round(packet.position.y * 10) / 10,
-          z: Math.round(packet.position.z * 10) / 10,
-          yaw: packet.rotation ? Math.round(packet.rotation.z || 0) : 0,
-          pitch: packet.rotation ? Math.round(packet.rotation.x || 0) : 0,
-          dimension: 'overworld'
-        };
-        if (this.bot && this.bot.entity) {
-          this.bot.entity.position = new Vec3(packet.position.x, packet.position.y, packet.position.z);
-        }
+      if (!packet || !packet.position || !isOwnMovePacket(client, packet)) return;
+      const yaw = packet.yaw !== undefined ? packet.yaw : (packet.rotation && packet.rotation.z) || 0;
+      const pitch = packet.pitch !== undefined ? packet.pitch : (packet.rotation && packet.rotation.x) || 0;
+      this.position = {
+        x: Math.round(packet.position.x * 10) / 10,
+        y: Math.round(packet.position.y * 10) / 10,
+        z: Math.round(packet.position.z * 10) / 10,
+        yaw: Math.round(yaw),
+        pitch: Math.round(pitch),
+        dimension: (this.position && this.position.dimension) || 'overworld'
+      };
+      if (this.bot && this.bot.entity) {
+        this.bot.entity.position = new Vec3(packet.position.x, packet.position.y, packet.position.z);
       }
     });
 
     client.on('text', (packet) => {
-      if (!packet) return;
-      let textContent = packet.message || packet.source_name || '';
-      if (packet.type === 'translation' && Array.isArray(packet.parameters)) {
-        textContent = packet.parameters.join(' ');
-      }
-      const cleaned = cleanMcText(textContent);
+      const cleaned = cleanMcText(formatBedrockText(packet));
       if (cleaned) {
         const isChat = packet.type === 'chat' || packet.type === 'whisper';
         this.addLog(cleaned, isChat ? 'chat' : 'info');
@@ -1200,19 +1537,38 @@ class BotManager {
     });
 
     client.on('kick', (reason) => {
-      const cleanReason = cleanMcText(typeof reason === 'object' ? JSON.stringify(reason) : String(reason));
+      if (this.bedrockClient !== client) return;
+      const rawReason = reason && typeof reason === 'object' ? (reason.message || reason.reason || JSON.stringify(reason)) : String(reason);
+      const cleanReason = cleanMcText(rawReason);
       this.addLog(`Dikeluarkan dari server Bedrock: ${cleanReason}`, 'warning');
       this.updateStatus('offline', 'Dikeluarkan');
     });
 
     client.on('error', (err) => {
-      this.addLog(`Eror koneksi Bedrock: ${err.message}`, 'error');
-      this.updateStatus('error', err.message);
+      if (this.bedrockClient !== client) return;
+      const message = formatBedrockConnectionError(err, this.sessionAuth);
+      if (this.sessionAuth === 'microsoft' && isTerminalMicrosoftAuthError(err)) {
+        this.bedrockAuthFailureMessage = message;
+      }
+      this.addLog(message, 'error');
+      this.updateStatus('error', message);
     });
 
-    client.on('close', () => {
-      this.addLog(`Koneksi terputus dari server Bedrock.`, 'warning');
+    client.once('close', () => {
+      if (this.bedrockClient !== client) return;
+      clearTimeout(loginResponseTimer);
+      loginResponseTimer = null;
+      const closeDetail = raknetDisconnectLogged
+        ? 'Detail disconnect backend tercatat di atas.'
+        : 'Tidak ada event disconnect RakNet yang memberikan detail tambahan.';
+      const elapsedSeconds = ((Date.now() - connectionStartedAt) / 1000).toFixed(1);
+      this.addLog(`Koneksi Bedrock ditutup setelah ${elapsedSeconds} dtk pada tahap ${connectionPhase} (status protokol: ${clientStatus}; paket server terakhir: ${lastServerPacket}). ${closeDetail}`, 'warning');
       this.cleanup();
+      if (this.bedrockAuthFailureMessage) {
+        this.updateStatus('error', this.bedrockAuthFailureMessage);
+        this.addLog('Auto-reconnect dihentikan karena login Microsoft gagal. Klik "Mulai dengan Xbox" untuk mendapatkan kode baru.', 'warning');
+        return;
+      }
       this.updateStatus('offline', 'Terputus');
       this.scheduleReconnect();
     });
@@ -1238,7 +1594,7 @@ class BotManager {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.status === 'offline' || this.status === 'error') {
-        this.start();
+        this.start(this.sessionAuth);
       }
     }, delayMs);
   }
@@ -1250,17 +1606,11 @@ class BotManager {
     }
     try {
       if (this.config.platform === 'bedrock' && this.bedrockClient) {
-        if (typeof this.bedrockClient.chat === 'function') {
-          this.bedrockClient.chat(message);
+        const c = this.bedrockClient;
+        if (message.startsWith('/')) {
+          c.queue('command_request', buildBedrockCommand(c.options && c.options.version, message));
         } else {
-          this.bedrockClient.queue('text', {
-            type: 'chat',
-            needs_translation: false,
-            source_name: this.config.username,
-            xuid: '',
-            platform_chat_id: '',
-            message: message
-          });
+          c.queue('text', buildBedrockChat((c.profile && c.profile.name) || this.config.username, message));
         }
       } else if (this.bot) {
         this.bot.chat(message);
@@ -1477,6 +1827,7 @@ function saveSecurityConfig() {
 loadSecurityConfig();
 
 const activeTokens = new Set();
+const pendingMsaCodes = new Map();
 
 // Middleware & Static Files
 app.use(express.static(path.join(__dirname, 'public')));
@@ -1486,6 +1837,217 @@ app.get('/api/accounts', (req, res) => {
   const summary = Object.values(botInstances).map(b => b.getState());
   res.json(summary);
 });
+
+app.post('/api/cli/auth', (req, res) => {
+  const password = req.body && typeof req.body.password === 'string' ? req.body.password : '';
+  if (securityConfig.enabled && password !== securityConfig.password) {
+    return res.status(401).json({ error: 'Kata sandi dashboard salah.' });
+  }
+  const token = `cli_${Math.random().toString(36).substring(2)}${Date.now().toString(36)}`;
+  activeTokens.add(token);
+  return res.json({ token, securityEnabled: securityConfig.enabled });
+});
+
+app.use('/api/cli', (req, res, next) => {
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!activeTokens.has(token)) return res.status(401).json({ error: 'Sesi CLI tidak valid atau sudah dikunci. Login kembali.' });
+  next();
+});
+
+app.post('/api/cli/lock', (req, res) => {
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  activeTokens.delete(token);
+  res.json({ ok: true });
+});
+
+app.get('/api/cli/state', (req, res) => {
+  const bots = Object.values(botInstances).map(getCliBotState);
+  res.json({
+    security: { enabled: securityConfig.enabled },
+    quickCommands,
+    bots
+  });
+});
+
+app.post('/api/cli/action', (req, res) => {
+  const payload = req.body && typeof req.body === 'object' ? req.body : {};
+  const bot = payload.botId ? getBot(payload.botId) : null;
+  const requireBot = () => {
+    if (bot) return true;
+    res.status(404).json({ error: `Akun bot '${payload.botId || ''}' tidak ditemukan.` });
+    return false;
+  };
+
+  switch (payload.action) {
+    case 'start-bot':
+      if (!requireBot()) return;
+      bot.start(payload.auth);
+      return res.json({ ok: true });
+    case 'stop-bot':
+      if (!requireBot()) return;
+      bot.stop();
+      return res.json({ ok: true });
+    case 'start-all':
+      Object.values(botInstances).forEach(instance => instance.start());
+      return res.json({ ok: true });
+    case 'stop-all':
+      Object.values(botInstances).forEach(instance => instance.stop());
+      return res.json({ ok: true });
+    case 'send-chat':
+      if (!requireBot()) return;
+      if (typeof payload.message !== 'string' || !payload.message.trim()) return res.status(400).json({ error: 'Pesan tidak boleh kosong.' });
+      bot.sendChat(payload.message);
+      return res.json({ ok: true });
+    case 'run-chat-command':
+      if (!requireBot()) return;
+      if (typeof payload.command !== 'string' || !payload.command.trim()) return res.status(400).json({ error: 'Command tidak boleh kosong.' });
+      bot.runChatCommand(payload.command);
+      return res.json({ ok: true });
+    case 'use-item':
+    case 'click-gui-slot':
+      if (!requireBot()) return;
+      if (!Number.isInteger(payload.slot) || payload.slot < 0) return res.status(400).json({ error: 'Slot harus berupa bilangan bulat nol atau lebih.' });
+      if (payload.action === 'use-item') bot.useInventoryItem(payload.slot);
+      else bot.clickGuiSlot(payload.slot);
+      return res.json({ ok: true });
+    case 'close-gui':
+      if (!requireBot()) return;
+      bot.closeGui();
+      return res.json({ ok: true });
+    case 'update-bot-config':
+      if (!requireBot()) return;
+      if (!payload.config || typeof payload.config !== 'object' || Array.isArray(payload.config)) return res.status(400).json({ error: 'Konfigurasi harus berupa object.' });
+      bot.config = { ...bot.config, ...payload.config };
+      saveAccounts();
+      io.emit('bot-config-updated', { botId: payload.botId, config: bot.config });
+      return res.json({ ok: true });
+    case 'add-account':
+      try {
+        const created = addAccount(payload.account);
+        return res.json({ ok: true, bot: getCliBotState(getBot(created.config.id)) });
+      } catch (err) {
+        return res.status(400).json({ error: `Gagal menambah akun: ${err.message}` });
+      }
+    case 'remove-account':
+      if (!requireBot()) return;
+      bot.stop();
+      delete botInstances[payload.botId];
+      saveAccounts();
+      io.emit('account-removed', { botId: payload.botId });
+      return res.json({ ok: true });
+    case 'update-quick-commands':
+      quickCommands = sanitizeQuickCommands(payload.commands);
+      try {
+        fs.writeFileSync(QUICK_FILE, JSON.stringify(quickCommands, null, 2));
+      } catch (err) {
+        console.error('Gagal menyimpan quick_commands.json:', err.message);
+        return res.status(500).json({ error: `Gagal menyimpan quick commands: ${err.message}` });
+      }
+      io.emit('quick-commands', quickCommands);
+      return res.json({ ok: true, quickCommands });
+    case 'update-security-config':
+      if (!payload.config || typeof payload.config.enabled !== 'boolean') return res.status(400).json({ error: 'Pengaturan keamanan memerlukan enabled true/false.' });
+      securityConfig.enabled = payload.config.enabled;
+      if (typeof payload.config.password === 'string' && payload.config.password.trim()) securityConfig.password = payload.config.password.trim();
+      saveSecurityConfig();
+      io.emit('security-config-updated', { enabled: securityConfig.enabled });
+      return res.json({ ok: true, security: { enabled: securityConfig.enabled } });
+    case 'snapshot':
+      return res.json(Object.values(botInstances).map(instance => instance.getSpatialPayload()));
+    default:
+      return res.status(400).json({ error: `Aksi CLI tidak dikenal: ${payload.action || ''}` });
+  }
+});
+
+function getCliBotState(bot) {
+  const state = bot.getState();
+  const { password, scriptText, ...config } = state.config;
+  return {
+    ...state,
+    config,
+    pendingMsaCode: pendingMsaCodes.get(config.id) || null
+  };
+}
+
+function addAccount(newAccData) {
+  if (!newAccData || typeof newAccData !== 'object') throw new Error('Data akun tidak valid.');
+
+  const platform = String(newAccData.platform || 'java').toLowerCase();
+  const type = String(newAccData.type || 'cracked').toLowerCase();
+  const rawUsername = String(newAccData.username || '').trim();
+  const password = String(newAccData.password || '').trim();
+  const host = String(newAccData.host || 'alwination.id').trim();
+  const defaultPort = platform === 'bedrock' ? 19132 : 25565;
+  const port = parseInt(newAccData.port || defaultPort);
+  const version = String(newAccData.version || 'auto');
+
+  if (!rawUsername) throw new Error('Username / Email tidak boleh kosong!');
+  if (!/^[a-zA-Z0-9.-]{1,253}$/.test(host)) throw new Error('Host server tidak valid!');
+  if (isNaN(port) || port < 1 || port > 65535) throw new Error('Port harus berupa angka 1-65535!');
+
+  const safeId = rawUsername.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  let botId = safeId;
+  if (botInstances[botId]) botId = `${safeId}_${Date.now().toString(36)}`;
+
+  const existingPorts = Object.values(botInstances).map(b => b.config.viewerPort || 3000);
+  let nextViewerPort = 3001;
+  while (existingPorts.includes(nextViewerPort)) nextViewerPort++;
+
+  const targetServer = String(newAccData.targetServer || '').trim();
+  const nextCmdRaw = String(newAccData.nextCmd || '').trim();
+  const autoCmdsList = [];
+  if (type === 'cracked') autoCmdsList.push({ cmd: `/login ${password || '{password}'}`, delaySec: 2 });
+  if (targetServer) {
+    const cleanServer = targetServer.replace(/^\/server\s+/, '').replace(/^\//, '');
+    autoCmdsList.push({ cmd: `/server ${cleanServer}`, delaySec: 2 });
+  }
+  if (nextCmdRaw) {
+    const cleanNext = nextCmdRaw.startsWith('/') ? nextCmdRaw : `/${nextCmdRaw}`;
+    autoCmdsList.push({ cmd: cleanNext, delaySec: 2 });
+  }
+  if (autoCmdsList.length === 0) {
+    if (type === 'cracked') autoCmdsList.push({ cmd: `/login ${password || '{password}'}`, delaySec: 2 });
+    autoCmdsList.push({ cmd: '/server tycoon', delaySec: 2 });
+    autoCmdsList.push({ cmd: '/is', delaySec: 2 });
+  }
+
+  const scriptLines = [];
+  autoCmdsList.forEach((row, idx) => {
+    if (idx > 0) scriptLines.push(`wait ${(row.delaySec || 2) * 20}`);
+    let command = row.cmd;
+    if (!command.toLowerCase().startsWith('send ')) {
+      if (!command.startsWith('/')) command = `/${command}`;
+      command = `send ${command}`;
+    }
+    scriptLines.push(command);
+  });
+
+  const newConfig = {
+    id: botId,
+    username: rawUsername,
+    password,
+    platform,
+    type,
+    auth: type === 'premium' ? 'microsoft' : 'offline',
+    host: host || 'alwination.id',
+    port: isNaN(port) ? defaultPort : port,
+    viewerPort: nextViewerPort,
+    version,
+    autoReconnect: true,
+    reconnectDelay: 10,
+    scriptEnabled: true,
+    autoCmds: autoCmdsList,
+    scriptText: scriptLines.join('\n')
+  };
+
+  const newBot = new BotManager(newConfig);
+  botInstances[botId] = newBot;
+  saveAccounts();
+  io.emit('account-added', newBot.getState());
+  return newBot.getState();
+}
 
 // WebSocket Handlers
 io.on('connection', (socket) => {
@@ -1546,9 +2108,11 @@ io.on('connection', (socket) => {
   });
 
   // Bot control handlers
-  socket.on('start-bot', (botId) => {
+  socket.on('start-bot', (payload) => {
+    const botId = typeof payload === 'string' ? payload : payload && payload.botId;
+    const auth = payload && typeof payload === 'object' ? payload.auth : undefined;
     const bot = getBot(botId);
-    if (bot) bot.start();
+    if (bot) bot.start(auth);
   });
 
   socket.on('stop-bot', (botId) => {
@@ -1619,102 +2183,7 @@ io.on('connection', (socket) => {
 
   socket.on('add-account', (newAccData) => {
     try {
-      if (!newAccData || typeof newAccData !== 'object') return;
-
-      const platform = String(newAccData.platform || 'java').toLowerCase();
-      const type = String(newAccData.type || 'cracked').toLowerCase();
-      const rawUsername = String(newAccData.username || '').trim();
-      const password = String(newAccData.password || '').trim();
-      const host = String(newAccData.host || 'alwination.id').trim();
-      const defaultPort = platform === 'bedrock' ? 19132 : 25565;
-      const port = parseInt(newAccData.port || defaultPort);
-      const version = String(newAccData.version || 'auto');
-
-      if (!rawUsername) {
-        socket.emit('account-error', { message: 'Username / Email tidak boleh kosong!' });
-        return;
-      }
-
-      if (!/^[a-zA-Z0-9.-]{1,253}$/.test(host)) {
-        socket.emit('account-error', { message: 'Host server tidak valid!' });
-        return;
-      }
-
-      if (isNaN(port) || port < 1 || port > 65535) {
-        socket.emit('account-error', { message: 'Port harus berupa angka 1-65535!' });
-        return;
-      }
-
-      // Generate clean unique ID
-      const safeId = rawUsername.toLowerCase().replace(/[^a-z0-9_]/g, '_');
-      let botId = safeId;
-      if (botInstances[botId]) {
-        botId = `${safeId}_${Date.now().toString(36)}`;
-      }
-
-      // Calculate next available viewer port
-      const existingPorts = Object.values(botInstances).map(b => b.config.viewerPort || 3000);
-      let nextViewerPort = 3001;
-      while (existingPorts.includes(nextViewerPort)) {
-        nextViewerPort++;
-      }
-
-      const targetServer = String(newAccData.targetServer || '').trim();
-      const nextCmdRaw = String(newAccData.nextCmd || '').trim();
-
-      const autoCmdsList = [];
-      if (type === 'cracked') {
-        autoCmdsList.push({ cmd: `/login ${password || '{password}'}`, delaySec: 2 });
-      }
-      if (targetServer) {
-        const cleanServer = targetServer.replace(/^\/server\s+/, '').replace(/^\//, '');
-        autoCmdsList.push({ cmd: `/server ${cleanServer}`, delaySec: 2 });
-      }
-      if (nextCmdRaw) {
-        const cleanNext = nextCmdRaw.startsWith('/') ? nextCmdRaw : '/' + nextCmdRaw;
-        autoCmdsList.push({ cmd: cleanNext, delaySec: 2 });
-      }
-
-      if (autoCmdsList.length === 0) {
-        if (type === 'cracked') autoCmdsList.push({ cmd: `/login ${password || '{password}'}`, delaySec: 2 });
-        autoCmdsList.push({ cmd: '/server tycoon', delaySec: 2 });
-        autoCmdsList.push({ cmd: '/is', delaySec: 2 });
-      }
-
-      const scriptLines = [];
-      autoCmdsList.forEach((row, idx) => {
-        if (idx > 0) scriptLines.push(`wait ${(row.delaySec || 2) * 20}`);
-        let c = row.cmd;
-        if (!c.toLowerCase().startsWith('send ')) {
-          if (!c.startsWith('/')) c = '/' + c;
-          c = 'send ' + c;
-        }
-        scriptLines.push(c);
-      });
-
-      const newConfig = {
-        id: botId,
-        username: rawUsername,
-        password: password,
-        platform: platform,
-        type: type,
-        auth: type === 'premium' ? 'microsoft' : 'offline',
-        host: host || 'alwination.id',
-        port: isNaN(port) ? defaultPort : port,
-        viewerPort: nextViewerPort,
-        version: version,
-        autoReconnect: true,
-        reconnectDelay: 10,
-        scriptEnabled: true,
-        autoCmds: autoCmdsList,
-        scriptText: scriptLines.join('\n')
-      };
-
-      const newBot = new BotManager(newConfig);
-      botInstances[botId] = newBot;
-      saveAccounts();
-
-      io.emit('account-added', newBot.getState());
+      addAccount(newAccData);
     } catch (err) {
       console.error('Error adding account:', err);
       socket.emit('account-error', { message: `Gagal menambah akun: ${err.message}` });
@@ -1778,6 +2247,15 @@ setInterval(() => {
     }
   }
 }, 20000);
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[STARTUP] Port ${PORT} sudah digunakan. Hentikan instance AFK App yang lama sebelum menjalankan instance baru.`);
+  } else {
+    console.error(`[STARTUP] Gagal membuka server pada port ${PORT}: ${err.message}`);
+  }
+  process.exit(1);
+});
 
 server.listen(PORT, () => {
   console.log(`====================================================`);

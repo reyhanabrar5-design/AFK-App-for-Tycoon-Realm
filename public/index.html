@@ -99,6 +99,9 @@
           <button class="btn btn-success" id="btn-start-single">
             <i class="fa-solid fa-play"></i> <span>Mulai Bot Ini</span>
           </button>
+          <button class="btn btn-primary" id="btn-start-xbox" style="display: none;">
+            <i class="fa-brands fa-xbox"></i> <span>Mulai dengan Xbox</span>
+          </button>
           <button class="btn btn-danger" id="btn-stop-single" style="display: none;">
             <i class="fa-solid fa-square"></i> <span>Hentikan Bot Ini</span>
           </button>
@@ -269,7 +272,7 @@
               <div class="mc-inventory-grid" id="inventory-grid-container">
                 <!-- Dynamically populated 36 inventory slots (27 tas + 9 hotbar) -->
               </div>
-              <div class="mc-inventory-hint">Klik kanan item untuk menggunakannya (booster, dll.)</div>
+              <div class="mc-inventory-hint">PC: klik kanan item &middot; HP: ketuk item lalu tekan Gunakan</div>
             </div>
           </div>
 
@@ -389,6 +392,7 @@
                 <i class="fa-solid fa-floppy-disk"></i> Simpan Tombol
               </button>
             </div>
+            <p id="quick-cmd-status" style="margin-top: 0.6rem; font-size: 0.8rem; min-height: 1.2em;"></p>
           </div>
 
           <!-- Security & Password Protection Settings Card -->
@@ -469,7 +473,10 @@
           <i class="fa-solid fa-box-open"></i>
           <h3 id="gui-modal-title">Fix Your Generators</h3>
         </div>
-        <button class="btn-close-modal" id="btn-close-gui-modal">&times;</button>
+        <div class="chest-gui-actions">
+          <button class="btn-close-modal" id="btn-min-gui-modal" title="Sembunyikan (jendela tetap terbuka di bot, bisa pindah akun)">&minus;</button>
+          <button class="btn-close-modal" id="btn-close-gui-modal" title="Tutup jendela di Minecraft">&times;</button>
+        </div>
       </div>
 
       <div class="chest-gui-body">
